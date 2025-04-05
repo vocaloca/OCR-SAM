@@ -1,29 +1,64 @@
 import cv2
 import gradio as gr
 import numpy as np
+import os
+import sys
 import PIL.Image as Image
 import torch
+from logging import getLogger, INFO
+from linguana import gcp
 from matplotlib import pyplot as plt
+
 # MMOCR
 from mmocr.apis.inferencers import MMOCRInferencer
 from mmocr.utils import poly2bbox
+from mmocr.utils.polygon_utils import offset_polygon
+
 # SAM
 from segment_anything import SamPredictor, sam_model_registry
+
 # Diffusion model
-from diffusers import StableDiffusionInpaintPipeline
-from mmocr.utils.polygon_utils import offset_polygon
-import sys
+try:
+    from diffusers import StableDiffusionInpaintPipeline
+except ImportError:
+    # Fallback for case where huggingface_hub has version conflicts
+    os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+    os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+    # Monkey patch huggingface_hub for compatibility with diffusers
+    import huggingface_hub
+    if (not hasattr(huggingface_hub, 'cached_download') and 
+            hasattr(huggingface_hub, 'hf_hub_download')):
+        huggingface_hub.cached_download = huggingface_hub.hf_hub_download
+    from diffusers import StableDiffusionInpaintPipeline
 
+# Add latent diffusion path
 sys.path.append('latent_diffusion')
-from latent_diffusion.ldm_erase_text import erase_text_from_image, instantiate_from_config, OmegaConf
+from latent_diffusion.ldm_erase_text import (
+    erase_text_from_image, instantiate_from_config, OmegaConf
+)
 
-det_config = 'mmocr_dev/configs/textdet/dbnetpp/dbnetpp_swinv2_base_w16_in21k.py'  # noqa
-det_weight = 'checkpoints/mmocr/db_swin_mix_pretrain.pth'
+logger = getLogger(__name__)
+logger.setLevel(INFO)
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+det_config = ('mmocr_dev/configs/textdet/dbnetpp/'
+              'dbnetpp_swinv2_base_w16_in21k.py')
+det_weight = '/checkpoints/mmocr/db_swin_mix_pretrain.pth'
 rec_config = 'mmocr_dev/configs/textrecog/abinet/abinet_20e_st-an_mj.py'
-rec_weight = 'checkpoints/mmocr/abinet_20e_st-an_mj_20221005_012617-ead8c139.pth'
-sam_checkpoint = 'checkpoints/sam/sam_vit_h_4b8939.pth'
+rec_weight = ('/checkpoints/mmocr/'
+              'abinet_20e_st-an_mj_20221005_012617-ead8c139.pth')
+sam_checkpoint = '/checkpoints/sam/sam_vit_h_4b8939.pth'
 device = 'cuda'
 sam_type = 'vit_h'
+
+try:
+    gcp.download_blob('linguana-models', 'image-eraser/', '/checkpoints/')
+    gcp.download_blob('linguana-models', 'image-eraser-eyal/', '/checkpoints/')
+    logger.info("Downloaded models from GCP")
+except Exception as e:
+    logger.error(f"Error initializing models or pipelines: {e}")
+    raise   
 
 # BUILD MMOCR
 mmocr_inferencer = MMOCRInferencer(
@@ -36,10 +71,11 @@ sam_predictor = SamPredictor(sam)
 
 def multi_mask2one_mask(masks):
     _, _, h, w = masks.shape
+    whole_mask = None
     for i, mask in enumerate(masks):
         mask_image = mask.reshape(h, w, 1)
         whole_mask = mask_image if i == 0 else whole_mask + mask_image
-    whole_mask = np.where(whole_mask == False, 0, 255)
+    whole_mask = np.where(whole_mask == 0, 0, 255)
     return whole_mask
 
 
@@ -112,6 +148,7 @@ def run_mmocr_sam(img: np.ndarray, ):
         plt.plot(polygon[:, 0], polygon[:, 1], '--', color='b', linewidth=4)
         # plot text on the left top corner of the polygon
         text_string = f'idx:{idx}, {rec_text}'
+        bbox = bbox.cpu().numpy()
         plt.text(
             bbox[0],
             bbox[1],
@@ -216,8 +253,8 @@ if __name__ == '__main__':
                 mask_results = gr.Textbox(label='Mask Results', max_lines=2)
                 mmocr_sam = gr.Button('Run MMOCR and SAM')
                 text_index = gr.Textbox(
-                    label=
-                    'Select Text Index. It can be multiple indices separated by commas.'
+                    label='Select Text Index. It can be multiple indices '
+                          'separated by commas.'
                 )
                 diffusion_type = gr.Radio(
                     choices=['Stable Diffusion', 'Latent Diffusion'],
@@ -257,4 +294,10 @@ if __name__ == '__main__':
                 ],
                 outputs=[output_image])
 
-    demo.launch(debug=True)
+    # Simple launch with minimal options to avoid pydantic schema generation issues
+    demo.launch(
+        debug=True,
+        server_name="0.0.0.0", 
+        server_port=7860,
+        show_api=False  # Disable API documentation to avoid schema generation
+    )
