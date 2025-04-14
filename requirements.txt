@@ -9,5 +9,7 @@ diffusers==0.14.0
 diffusers==0.14.0
 google-cloud-storage
 google-cloud-pubsub
+google-cloud-secret-manager==2.23.1
 requests
 google-auth
+openai
