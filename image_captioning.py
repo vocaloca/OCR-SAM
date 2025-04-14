@@ -49,6 +49,12 @@ Return only the transcription, without additional words or explanations.
 Return 'None' if unable to transcribe or if no text found in the image.
 """
 
+OCR_USE_PROMPT_SINGLE_LINE = """
+Transcribe the text in the image.
+Return only the transcription, without additional words or explanations.
+Return 'None' if unable to transcribe or if no text found in the image.
+"""
+
 OCR_COUNT_LINES_USER_PROMPT = """
 How many text lines appear in the image?
 Return a single numeric output. 

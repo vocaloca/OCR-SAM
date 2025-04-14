@@ -2,31 +2,39 @@ from typing import List
 import numpy as np
 import cv2
 from mmocr.utils import poly2bbox
+from math import atan2, degrees
+import difflib
 
 
 def group_polygons_in_lines(polygons: List[np.ndarray], 
                             rec_texts: List[str],
                             det_polygon_imgs: List[dict] = None,
                             num_lines: int = None,
-                            drop_outliers: bool = True):
+                            drop_outliers: bool = True,
+                            line_threshold_pct: float = 0.2,
+                            angle_threshold: float = 15):
     """Group the polygons into text lines.
     
     This function takes a list of polygons (text bounding boxes) and groups them
-    into lines based on their angles and positions. It uses a two-step approach:
-    1. Group polygons by similar rotation angles
-    2. For each angle group, cluster the polygons into lines
+    into lines based on their angles and positions. It uses a hierarchical 
+    clustering approach that accounts for text rotation and angles.
     
     Args:
         polygons: List of polygons, each as numpy array of points
         rec_texts: List of recognized texts corresponding to polygons
-        det_polygon_imgs: List of dictionaries containing angle and original_points information
+        det_polygon_imgs: List of dictionaries containing angle and original_points
         num_lines: Fixed number of lines to group into (if specified)
         drop_outliers: Whether to remove outlier text boxes from each line
+        line_threshold_pct: Percentage of text height/width to use as threshold
+        angle_threshold: Maximum angle difference (degrees) to consider polygons
+                         aligned in the same line
         
     Returns:
         Tuple of (line_groups, line_polygons) where:
-            - line_groups: List of lists containing indices of polygons in each line
-            - line_polygons: List of polygons representing each line's bounding region
+            - line_groups: List of lists containing indices of polygons in each
+              line
+            - line_polygons: List of polygons representing each line's bounding
+              region
     """
     if not polygons or not rec_texts:
         return [], []
@@ -37,192 +45,313 @@ def group_polygons_in_lines(polygons: List[np.ndarray],
         for polygon in polygons:
             # Use axis-aligned bounding box as fallback (0° angle)
             det_polygon_imgs.append({'angle': 0, 'original_points': polygon})
+    
+    # Calculate features for each polygon: centroid, angle and dimensions
+    box_features = []
+    for i, polygon in enumerate(polygons):
+        # Convert to numpy array and reshape if needed
+        polygon_array = np.array(polygon).reshape(-1, 2)
         
-    # Extract exact number of lines from rec_texts if num_lines is provided
+        # Calculate centroid
+        centroid = polygon_array.mean(axis=0)
+        
+        # Get angle from det_polygon_imgs if available, or estimate from points
+        if 'angle' in det_polygon_imgs[i]:
+            angle = det_polygon_imgs[i]['angle']
+        else:
+            # Estimate text angle (using top edge points)
+            # This assumes a specific order of points in the polygon
+            # For more robustness, we could use PCA or minimum area rectangle
+            if len(polygon_array) >= 4:
+                # Use first two points to estimate angle
+                dx = polygon_array[1, 0] - polygon_array[0, 0]
+                dy = polygon_array[1, 1] - polygon_array[0, 1]
+                angle = degrees(atan2(dy, dx))
+            else:
+                angle = 0  # Fallback
+        
+        # Calculate bounding box for size information
+        bbox = poly2bbox(polygon)
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        
+        box_features.append({
+            'index': i,
+            'polygon': polygon,
+            'centroid': centroid,
+            'angle': angle,
+            'width': width,
+            'height': height,
+            'text': rec_texts[i] if i < len(rec_texts) else ''
+        })
+    
+    # Define projection function for hierarchical clustering
+    def project_point_to_reference_line(point, reference_point, angle):
+        """Project a point onto a line with given angle passing through reference"""
+        # Convert angle to radians
+        angle_rad = np.radians(angle)
+        
+        # Create direction vector for the line
+        direction = np.array([np.cos(angle_rad), np.sin(angle_rad)])
+        
+        # Vector from reference point to the point
+        point_vector = np.array(point) - np.array(reference_point)
+        
+        # Project point_vector onto the direction
+        projection = np.dot(point_vector, direction) * direction
+        
+        # Get the projected point
+        projected_point = np.array(reference_point) + projection
+        
+        # Calculate signed distance along the line
+        distance_along_line = np.dot(point_vector, direction)
+        
+        # Calculate perpendicular distance
+        perp_distance = np.linalg.norm(point_vector - projection)
+        
+        return projected_point, distance_along_line, perp_distance
+    
+    # Initial sort by y-coordinate (for approximate vertical position)
+    box_features.sort(key=lambda x: x['centroid'][1])
+    
+    # Check if we should use the fixed number of lines approach
     if num_lines is not None and num_lines > 0:
-        # Get angle information from the rotated crops
-        angles = [det_polygon_img['angle'] for det_polygon_img in det_polygon_imgs]
+        # Hierarchical clustering with adaptive threshold
+        clusters = [[box_features[0]]] if box_features else []
         
-        # Get centroids for all polygons
-        centroids = []
-        for i, polygon in enumerate(polygons):
-            polygon_array = np.array(polygon).reshape(-1, 2)
-            centroid = polygon_array.mean(axis=0)
-            centroids.append((centroid, i))
-        
-        # Determine if text is primarily horizontal or vertical
-        # Check most common angle
-        primary_angles = [abs(angle) < 45 or abs(angle) > 135 for angle in angles]
-        is_horizontal = sum(primary_angles) > len(primary_angles) / 2
-        
-        # Sort by y-coordinate (for horizontal) or x-coordinate (for vertical)
-        sort_idx = 1 if is_horizontal else 0
-        
-        # Sort all indices by vertical position first
-        sorted_centroids = sorted(centroids, key=lambda x: x[0][sort_idx])
-        sorted_indices = [c[1] for c in sorted_centroids]
-        
-        # Divide into exactly num_lines groups
-        lines = []
-        indices_per_line = max(1, len(sorted_indices) // num_lines)
-        
-        for i in range(num_lines):
-            start_idx = i * indices_per_line
-            # For the last line, include all remaining indices
-            end_idx = (i + 1) * indices_per_line if i < num_lines - 1 else len(sorted_indices)
+        for box in box_features[1:]:
+            assigned = False
             
-            if start_idx < len(sorted_indices):
-                # Get indices for this line
-                line_indices = sorted_indices[start_idx:end_idx]
+            for cluster in clusters:
+                # Use average angle and centroid of cluster as reference
+                cluster_angle = sum(item['angle'] for item in cluster) / len(cluster)
+                ref_centroid = (
+                    sum(item['centroid'][0] for item in cluster) / len(cluster),
+                    sum(item['centroid'][1] for item in cluster) / len(cluster)
+                )
                 
-                # Sort horizontally within the line
-                other_sort_idx = 0 if is_horizontal else 1
-                line_centroids = [(centroids[j][0][other_sort_idx], j) for j in line_indices]
-                line_indices = [c[1] for c in sorted(line_centroids, key=lambda x: x[0])]
+                # Check if angle is similar (accounting for rotation errors)
+                angle_diff = min(
+                    abs(box['angle'] - cluster_angle),
+                    abs(box['angle'] - cluster_angle + 360),
+                    abs(box['angle'] - cluster_angle - 360)
+                )
                 
-                # Remove outliers if requested and we have enough boxes
-                if drop_outliers and len(line_indices) > 3:
-                    line_indices = remove_outliers_from_line(
-                        line_indices, polygons, is_horizontal)
+                if angle_diff > angle_threshold:
+                    continue
                 
-                lines.append(line_indices)
+                # Get average height for this cluster
+                avg_height = sum(item['height'] for item in cluster) / len(cluster)
+                # Use height-based threshold (typically lines are separated by 1-2x height)
+                threshold = avg_height * line_threshold_pct * 2
+                
+                # Project this box's centroid onto the cluster's reference line
+                _, _, perp_distance = project_point_to_reference_line(
+                    box['centroid'], ref_centroid, cluster_angle
+                )
+                
+                # If perpendicular distance is small enough, add to this cluster
+                if perp_distance < threshold:
+                    cluster.append(box)
+                    assigned = True
+                    break
+            
+            if not assigned:
+                # Create a new cluster
+                clusters.append([box])
+        
+        # Enforce the expected line count
+        if len(clusters) != num_lines:
+            # Sort clusters by average y-coordinate
+            clusters.sort(
+                key=lambda cluster: sum(
+                    item['centroid'][1] for item in cluster
+                ) / len(cluster)
+            )
+            
+            if len(clusters) > num_lines:
+                # Merge clusters until we have the expected count
+                while len(clusters) > num_lines:
+                    # Find the closest pair of clusters to merge
+                    min_distance = float('inf')
+                    merge_pair = (0, 0)
+                    
+                    for i in range(len(clusters) - 1):
+                        centroid_i = (
+                            sum(item['centroid'][0] for item in clusters[i]) / len(clusters[i]),
+                            sum(item['centroid'][1] for item in clusters[i]) / len(clusters[i])
+                        )
+                        
+                        for j in range(i + 1, len(clusters)):
+                            centroid_j = (
+                                sum(item['centroid'][0] for item in clusters[j]) / len(clusters[j]),
+                                sum(item['centroid'][1] for item in clusters[j]) / len(clusters[j])
+                            )
+                            
+                            # Vertical distance
+                            dist = abs(centroid_i[1] - centroid_j[1])
+                            
+                            if dist < min_distance:
+                                min_distance = dist
+                                merge_pair = (i, j)
+                    
+                    # Merge the closest pair
+                    i, j = merge_pair
+                    clusters[i].extend(clusters[j])
+                    clusters.pop(j)
+            
+            elif len(clusters) < num_lines:
+                # Split the largest clusters until we have the expected count
+                while len(clusters) < num_lines:
+                    # Find the largest cluster
+                    largest_idx = max(range(len(clusters)), key=lambda i: len(clusters[i]))
+                    largest = clusters[largest_idx]
+                    
+                    if len(largest) < 2:
+                        # Can't split a cluster with only one box
+                        break
+                    
+                    # Sort by x-coordinate
+                    largest.sort(key=lambda item: item['centroid'][0])
+                    
+                    # Split into two parts
+                    split_point = len(largest) // 2
+                    clusters[largest_idx] = largest[:split_point]
+                    clusters.insert(largest_idx + 1, largest[split_point:])
+        
+        # Within each cluster, sort boxes horizontally (along text direction)
+        for cluster in clusters:
+            if len(cluster) <= 1:
+                continue
+                
+            # Get average angle for this cluster
+            cluster_angle = sum(item['angle'] for item in cluster) / len(cluster)
+            ref_centroid = (
+                sum(item['centroid'][0] for item in cluster) / len(cluster),
+                sum(item['centroid'][1] for item in cluster) / len(cluster)
+            )
+            
+            # Calculate projection distances along reading direction
+            for item in cluster:
+                _, distance, _ = project_point_to_reference_line(
+                    item['centroid'], ref_centroid, cluster_angle
+                )
+                item['projection_distance'] = distance
+            
+            # Sort by projection distance
+            cluster.sort(key=lambda item: item['projection_distance'])
+            
+            # Remove outliers if requested
+            if drop_outliers and len(cluster) > 3:
+                is_horizontal = abs(cluster_angle) < 45 or abs(cluster_angle) > 135
+                indices = [item['index'] for item in cluster]
+                filtered_indices = remove_outliers_from_line(
+                    indices, polygons, is_horizontal)
+                
+                # Update cluster to only contain boxes with indices in filtered_indices
+                cluster[:] = [item for item in cluster if item['index'] in filtered_indices]
+        
+        # Extract line groups and generate line polygons
+        line_groups = []
+        for cluster in clusters:
+            line_groups.append([item['index'] for item in cluster])
         
         # Handle case where we have fewer actual groups than requested num_lines
-        while len(lines) < num_lines:
-            lines.append([])
-            
+        while len(line_groups) < num_lines:
+            line_groups.append([])
+        
         # Generate line bounding polygons
-        line_polygons = generate_line_polygons(lines, polygons)
+        line_polygons = generate_line_polygons(line_groups, polygons)
+        
+        return line_groups, line_polygons
+    
+    # If num_lines is not specified, perform regular clustering without enforcing line count
+    # Hierarchical clustering with adaptive threshold
+    clusters = [[box_features[0]]] if box_features else []
+    
+    for box in box_features[1:]:
+        assigned = False
+        
+        for cluster in clusters:
+            # Use average angle and centroid of cluster as reference
+            cluster_angle = sum(item['angle'] for item in cluster) / len(cluster)
+            ref_centroid = (
+                sum(item['centroid'][0] for item in cluster) / len(cluster),
+                sum(item['centroid'][1] for item in cluster) / len(cluster)
+            )
             
-        return lines, line_polygons
-    
-    # If num_lines is not specified, fall back to clustering approach
-    # Get angle information from the rotated crops 
-    angles = [det_polygon_img['angle'] for det_polygon_img in det_polygon_imgs]
-    
-    # Step 1: Group polygons by similar angles (with tolerance)
-    angle_tolerance = 5  # degrees
-    angle_groups = {}
-    
-    for i, angle in enumerate(angles):
-        # Find a matching angle group or create a new one
-        matched = False
-        for group_angle in angle_groups:
-            if abs(angle - group_angle) < angle_tolerance:
-                angle_groups[group_angle].append(i)
-                matched = True
+            # Check if angle is similar (accounting for rotation errors)
+            angle_diff = min(
+                abs(box['angle'] - cluster_angle),
+                abs(box['angle'] - cluster_angle + 360),
+                abs(box['angle'] - cluster_angle - 360)
+            )
+            
+            if angle_diff > angle_threshold:
+                continue
+            
+            # Get average height for this cluster
+            avg_height = sum(item['height'] for item in cluster) / len(cluster)
+            # Use height-based threshold
+            threshold = avg_height * line_threshold_pct * 2
+            
+            # Project this box's centroid onto the cluster's reference line
+            _, _, perp_distance = project_point_to_reference_line(
+                box['centroid'], ref_centroid, cluster_angle
+            )
+            
+            # If perpendicular distance is small enough, add to this cluster
+            if perp_distance < threshold:
+                cluster.append(box)
+                assigned = True
                 break
         
-        if not matched:
-            angle_groups[angle] = [i]
-            
-    # Step 2: For each angle group, sort polygons into lines based on position
-    lines = []
-    for angle, indices in angle_groups.items():
-        if len(indices) <= 1:
-            # Single polygon in this angle group, it's its own line
-            lines.append(indices)
+        if not assigned:
+            # Create a new cluster
+            clusters.append([box])
+    
+    # Within each cluster, sort boxes horizontally (along text direction)
+    for cluster in clusters:
+        if len(cluster) <= 1:
             continue
             
-        # Get the centroids of polygons in this angle group
-        centroids = []
-        for idx in indices:
-            polygon = np.array(polygons[idx]).reshape(-1, 2)
-            centroid = polygon.mean(axis=0)
-            centroids.append(centroid)
+        # Get average angle for this cluster
+        cluster_angle = sum(item['angle'] for item in cluster) / len(cluster)
+        ref_centroid = (
+            sum(item['centroid'][0] for item in cluster) / len(cluster),
+            sum(item['centroid'][1] for item in cluster) / len(cluster)
+        )
         
-        centroids = np.array(centroids)
+        # Calculate projection distances along reading direction
+        for item in cluster:
+            _, distance, _ = project_point_to_reference_line(
+                item['centroid'], ref_centroid, cluster_angle
+            )
+            item['projection_distance'] = distance
         
-        # For this angle, determine primary direction (horizontal or vertical)
-        is_horizontal = abs(angle) < 45 or abs(angle) > 135
+        # Sort by projection distance
+        cluster.sort(key=lambda item: item['projection_distance'])
         
-        # Sort by y-coordinate (horizontal) or x-coordinate (vertical text)
-        sort_idx = 1 if is_horizontal else 0
-        
-        # Group into lines based on position
-        # Calculate a reasonable line spacing threshold
-        avg_height = 0
-        for idx in indices:
-            polygon = polygons[idx]
-            bbox = poly2bbox(polygon)
-            height = max(bbox[3] - bbox[1], bbox[2] - bbox[0]) / 2
-            avg_height += height
+        # Remove outliers if requested
+        if drop_outliers and len(cluster) > 3:
+            is_horizontal = abs(cluster_angle) < 45 or abs(cluster_angle) > 135
+            indices = [item['index'] for item in cluster]
+            filtered_indices = remove_outliers_from_line(
+                indices, polygons, is_horizontal)
             
-        avg_height /= len(indices)
-        line_threshold = avg_height * 0.7  # Adjust this threshold as needed
-        
-        # Sort indices by the primary coordinate
-        sorted_indices = [x for _, x in sorted(
-            zip(centroids[:, sort_idx], indices))]
-        
-        # Group into lines based on position
-        current_line = [sorted_indices[0]]
-        current_coord = centroids[indices.index(sorted_indices[0])][sort_idx]
-        
-        line_groups = []
-        
-        for i in range(1, len(sorted_indices)):
-            idx = sorted_indices[i]
-            idx_in_centroids = indices.index(idx)
-            coord = centroids[idx_in_centroids][sort_idx]
-            
-            # If polygon is close enough to current line, add it
-            if abs(coord - current_coord) < line_threshold:
-                current_line.append(idx)
-            else:
-                # Remove outliers if requested and we have enough boxes
-                if drop_outliers and len(current_line) > 3:
-                    current_line = remove_outliers_from_line(
-                        current_line, polygons, is_horizontal)
-                    
-                # Sort by the other coordinate
-                other_sort_idx = 0 if is_horizontal else 1
-                
-                # Create a list of coordinates for sorting
-                other_coords = []
-                for line_idx in current_line:
-                    line_idx_in_centroids = indices.index(line_idx)
-                    other_coord = centroids[line_idx_in_centroids][other_sort_idx]
-                    other_coords.append(other_coord)
-                
-                # Sort the current line by the other coordinate
-                current_line = [x for _, x in sorted(
-                    zip(other_coords, current_line))]
-                
-                # Start a new line
-                line_groups.append(current_line)
-                current_line = [idx]
-                current_coord = coord
-        
-        # Don't forget to add the last line
-        if current_line:
-            # Remove outliers if requested and we have enough boxes
-            if drop_outliers and len(current_line) > 3:
-                current_line = remove_outliers_from_line(
-                    current_line, polygons, is_horizontal)
-            
-            # Sort the line by the other coordinate
-            other_sort_idx = 0 if is_horizontal else 1
-            
-            # Create a list of coordinates for sorting
-            other_coords = []
-            for line_idx in current_line:
-                line_idx_in_centroids = indices.index(line_idx)
-                other_coord = centroids[line_idx_in_centroids][other_sort_idx]
-                other_coords.append(other_coord)
-            
-            # Sort the current line by the other coordinate
-            current_line = [x for _, x in sorted(
-                zip(other_coords, current_line))]
-            
-            line_groups.append(current_line)
-        
-        lines.extend(line_groups)
+            # Update cluster to only contain boxes with indices in filtered_indices
+            cluster[:] = [item for item in cluster if item['index'] in filtered_indices]
+    
+    # Extract line groups and generate line polygons
+    line_groups = []
+    for cluster in clusters:
+        line_groups.append([item['index'] for item in cluster])
     
     # Generate line bounding polygons
-    line_polygons = generate_line_polygons(lines, polygons)
-        
-    return lines, line_polygons
+    line_polygons = generate_line_polygons(line_groups, polygons)
+    
+    return line_groups, line_polygons
+
 
 def remove_outliers_from_line(line_indices, polygons, is_horizontal):
     """Remove outlier text boxes from a line based on position
@@ -269,7 +398,8 @@ def remove_outliers_from_line(line_indices, polygons, is_horizontal):
             filtered_indices.append(line_indices[i])
             
     return filtered_indices if filtered_indices else line_indices  # Fallback
-    
+
+
 def generate_line_polygons(lines, polygons):
     """Generate a bounding polygon for each line of text
     
@@ -319,3 +449,95 @@ def generate_line_polygons(lines, polygons):
         line_polygons.append(box.flatten())
         
     return line_polygons
+
+
+def match_text_to_lines(line_polygon_rec_texts: List[str], 
+                       rec_texts: List[str]) -> List[int]:
+    """Match recognized texts from line polygons to original recognized texts
+    based on textual similarity.
+    
+    Args:
+        line_polygon_rec_texts: List of texts from line polygons
+        rec_texts: List of original recognized texts
+        
+    Returns:
+        List of indices mapping each line_polygon_rec_text to the best 
+        matching text in rec_texts
+    """
+    if not line_polygon_rec_texts or not rec_texts:
+        return []
+    
+    # Create mapping array
+    matches = []
+    
+    # Process texts to improve matching (lowercase, strip whitespace)
+    processed_line_texts = [text.lower().strip() for text in line_polygon_rec_texts]
+    processed_rec_texts = [text.lower().strip() for text in rec_texts]
+    
+    # For each line polygon text, find the best matching text
+    for line_text in processed_line_texts:
+        if not line_text:
+            # If line text is empty, append -1 or the first available text
+            matches.append(0 if rec_texts else -1)
+            continue
+            
+        # Calculate similarity scores using difflib's SequenceMatcher
+        similarity_scores = []
+        for rec_text in processed_rec_texts:
+            if not rec_text:
+                similarity_scores.append(0.0)
+                continue
+                
+            # Calculate string similarity (ratio between 0 and 1)
+            similarity = difflib.SequenceMatcher(None, line_text, rec_text).ratio()
+            
+            # Add word-level matching for better accuracy
+            line_words = set(line_text.split())
+            rec_words = set(rec_text.split())
+            
+            # Calculate word overlap (Jaccard similarity)
+            if line_words and rec_words:
+                word_overlap = len(line_words.intersection(rec_words)) / len(line_words.union(rec_words))
+                # Combine character-level and word-level similarity
+                similarity = 0.7 * similarity + 0.3 * word_overlap
+            
+            similarity_scores.append(similarity)
+        
+        # Find index of highest similarity score
+        if similarity_scores:
+            best_match = similarity_scores.index(max(similarity_scores))
+            matches.append(best_match)
+        else:
+            matches.append(-1)
+    
+    return matches
+
+
+def match_and_sort_texts(line_polygon_rec_texts: List[str], 
+                         rec_texts: List[str]) -> List[str]:
+    """Match and sort recognized texts based on line polygons.
+    
+    Args:
+        line_polygon_rec_texts: List of texts from line polygons
+        rec_texts: List of original recognized texts
+        
+    Returns:
+        List of matched and sorted texts from rec_texts
+    """
+    # Get matches between line polygon texts and recognized texts
+    matches = match_text_to_lines(line_polygon_rec_texts, rec_texts)
+    
+    # Create sorted result based on matches
+    sorted_texts = []
+    for match_idx in matches:
+        if 0 <= match_idx < len(rec_texts):
+            sorted_texts.append(rec_texts[match_idx])
+        else:
+            # If no good match, use the line polygon text directly
+            idx = matches.index(match_idx)
+            if idx < len(line_polygon_rec_texts):
+                sorted_texts.append(line_polygon_rec_texts[idx])
+            else:
+                sorted_texts.append("")
+    
+    return sorted_texts

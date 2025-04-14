@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Literal
+from typing import List, Literal, Optional, Tuple
 import cv2
 import gradio as gr
 import numpy as np
@@ -30,6 +30,8 @@ from latent_diffusion.ldm_erase_text import (
 )
 
 MODEL_FOLDER = Path(__file__).parent / 'checkpoints'
+
+BoxType = Tuple[float, float, float, float, float, float, float, float]  # x1, y1, x2, y2, x3, y3, x4, y4
 
 # Call the configuration function
 image_captioning.configure_multilingual_fonts()
@@ -72,11 +74,11 @@ except Exception as e:
 
 # BUILD MMOCR
 mmocr_inferencer = MMOCRInferencer(
-    det_config, det_weight, rec_config, rec_weight, device=device)
-# Build SAM
-sam = sam_model_registry[sam_type](checkpoint=sam_checkpoint)
-sam = sam.to(device)
-sam_predictor = SamPredictor(sam)
+    det_config, det_weight, device=device)
+# # Build SAM
+# sam = sam_model_registry[sam_type](checkpoint=sam_checkpoint)
+# sam = sam.to(device)
+# sam_predictor = SamPredictor(sam)
 
 
 def multi_mask2one_mask(masks):
@@ -94,14 +96,14 @@ def numpy2PIL(numpy_image):
     return out
 
 
-def show_mask(mask, ax, random_color=False):
-    if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
-    else:
-        color = np.array([30 / 255, 144 / 255, 255 / 255, 0.6])
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    ax.imshow(mask_image)
+# def show_mask(mask, ax, random_color=False):
+#     if random_color:
+#         color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+#     else:
+#         color = np.array([30 / 255, 144 / 255, 255 / 255, 0.6])
+#     h, w = mask.shape[-2:]
+#     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+#     ax.imshow(mask_image)
 
 
 def crop_image_polygons(img: np.ndarray, polygons: list):  # -> List[np.ndarray]:
@@ -232,7 +234,7 @@ def get_ocr_single_shot_results(img: np.core.ndarray):
     else:
         return []
 
-def get_text_or_language_from_img(img: np.core.ndarray, mode: Literal['ocr', 'language', 'words_order'], **kwargs):
+def get_text_or_language_from_img(img: np.core.ndarray, mode: Literal['ocr', 'ocr_count_lines', 'ocr_single_shot', 'ocr_single_line', 'language', 'words_order'], **kwargs):
     """Get text or language from (cropped) images
     """
     if mode == 'ocr':
@@ -243,6 +245,9 @@ def get_text_or_language_from_img(img: np.core.ndarray, mode: Literal['ocr', 'la
         system_prompt = image_captioning.OCR_SYSTEM_PROMPT
     elif mode == 'ocr_single_shot':
         user_prompt = image_captioning.OCR_USE_PROMPT_SINGLE_SHOT(kwargs['num_lines'])
+        system_prompt = image_captioning.OCR_SYSTEM_PROMPT
+    elif mode == 'ocr_single_line':
+        user_prompt = image_captioning.OCR_USE_PROMPT_SINGLE_LINE
         system_prompt = image_captioning.OCR_SYSTEM_PROMPT
     elif mode == 'language':
         user_prompt = image_captioning.LANGUAGE_DETECTION_USER_PROMPT
@@ -271,7 +276,7 @@ def parse_words_order(words: str):
         words_order.append([word.strip() for word in words.split(',')])
     return words_order
 
-def run_mmocr_sam(img: np.ndarray, ):
+def run_text_recognition(img: np.ndarray, det_polygons: Optional[List[BoxType]] = None):
     """Run MMOCR and SAM
 
     Args:
@@ -291,38 +296,13 @@ def run_mmocr_sam(img: np.ndarray, ):
     """
     # Build MMOCR
 
-    result = mmocr_inferencer(img)['predictions'][0]
-    rec_texts = result['rec_texts']
-    det_polygons = result['det_polygons']
+    det_polygons = det_polygons or mmocr_inferencer(img)['predictions'][0]['det_polygons']  # text detection only
     det_polygon_imgs = create_mask_rotate_crop(
         img, det_polygons, box_expansion=0.1
     )
-    
-    # # Sort by minimum non-zero value along axis 1 first, then axis 0
-    # def get_min_nonzero(x):
-    #     mask = x['mask']
-    #     # Get minimum non-zero column (axis 1)
-    #     cols_with_content = np.where(np.any(mask > 0, axis=0))[0]
-    #     min_col = (cols_with_content.min() if cols_with_content.size > 0 
-    #                else float('inf'))
-        
-    #     # Get minimum non-zero row (axis 0)
-    #     rows_with_content = np.where(np.any(mask > 0, axis=1))[0]
-    #     min_row = (rows_with_content.min() if rows_with_content.size > 0 
-    #                else float('inf'))
-        
-    #     return (min_col, min_row)
-        
-    # det_polygon_imgs = sorted(det_polygon_imgs, key=get_min_nonzero)
-    
-    # TODO: try single-shot approach
     rec_texts = get_ocr_single_shot_results(img)
-    print(rec_texts)
+    # print(rec_texts)
     
-    # sort the polygons in lines
-    # given a list of polygons, determines which polygon belongs to which line and group them together. the lines could be in different angles, so determine the angle of the line first and then group the polygons by the angle
-    # cluster the polygons by their angle and perpendicular distance to a cluster's angle (you can use somethine like K-means clustering)
-
     # Calculate the line groupings
     lines, line_polygons = image_ocr_utils.group_polygons_in_lines(det_polygons, rec_texts, num_lines=len(rec_texts), det_polygon_imgs=det_polygon_imgs)
     print("expected num_lines={}, got num_lines={}".format(len(rec_texts), len(lines)))
@@ -351,26 +331,7 @@ def run_mmocr_sam(img: np.ndarray, ):
             
     plt.savefig('tmp_output.png')
     plt.close()
-
-    # # Analyze the text and language of the cropped images + words order
-    # det_polygon_imgs_analyzed = []
-    # for det_polygon_img in det_polygon_imgs:
-    #     text = get_text_or_language_from_img(det_polygon_img['image'], mode='ocr')
-    #     det_polygon_img['text'] = text
-    #     language = get_text_or_language_from_img(det_polygon_img['image'], mode='language')
-    #     det_polygon_img['language'] = language
-    #     det_polygon_imgs_analyzed.append(det_polygon_img)
         
-    # # TODO: Check this is correct
-    # rec_texts = [p['text'] for p in det_polygon_imgs_analyzed]
-
-    # # TODO: the pipeline is not stable, need to hangle fail cases    
-    # words_order = get_text_or_language_from_img(
-    #     img, mode='words_order', words=", ".join([f"\"{p.get('text')}\"" for p in det_polygon_imgs_analyzed]))
-    # print(f'words_order:\n{words_order}')
-    # words_order = parse_words_order(words_order)
-        
-    
     # Create output directory if it doesn't exist
     output_dir = f'{ROOT_DIR}/det_polygon_imgs'
     os.makedirs(output_dir, exist_ok=True)
@@ -381,19 +342,41 @@ def run_mmocr_sam(img: np.ndarray, ):
         
     det_bboxes = torch.tensor(
         np.array([poly2bbox(poly) for poly in line_polygons]),
-        device=sam_predictor.device)
-    transformed_boxes = sam_predictor.transform.apply_boxes_torch(
-        det_bboxes, img.shape[:2])
-    # SAM inference
-    sam_predictor.set_image(img, image_format='BGR')
-    masks, _, _ = sam_predictor.predict_torch(
-        point_coords=None,
-        point_labels=None,
-        boxes=transformed_boxes,
-        multimask_output=False,
+        device='cuda')
+
+    # TODO: match each line_polygon to the rec_texts, using API calls to ChatGPT-4o
+    line_polygon_imgs = create_mask_rotate_crop(
+        img, line_polygons, box_expansion=0.1
     )
+    line_polygon_rec_texts = []
+    for line_polygon_img in line_polygon_imgs:
+        text = get_text_or_language_from_img(line_polygon_img['image'], mode='ocr_single_line')
+        line_polygon_rec_texts.append(text)
+    print(line_polygon_rec_texts)
+    
+    # Match each line_polygon to the rec_texts based on textual similarity
+    text_matches = image_ocr_utils.match_text_to_lines(line_polygon_rec_texts, rec_texts)
+    
+    # Create a sorted/matched version of rec_texts
+    matched_texts = []
+    for match_idx in text_matches:
+        if 0 <= match_idx < len(rec_texts):
+            matched_texts.append(rec_texts[match_idx])
+        else:
+            # If no good match found, use the line polygon text directly
+            idx = text_matches.index(match_idx)
+            if idx < len(line_polygon_rec_texts):
+                matched_texts.append(line_polygon_rec_texts[idx])
+            else:
+                matched_texts.append("")
+    
+    print("Original rec_texts:", rec_texts)
+    print("Line polygon texts:", line_polygon_rec_texts)
+    print("Matched indices:", text_matches)
+    print("Final matched texts:", matched_texts)
+    
     # Draw results
-    plt.figure()
+    plt.figure(figsize=(12, 12))
     # close axis
     plt.axis('off')
     # convert img to RGB
@@ -401,13 +384,12 @@ def run_mmocr_sam(img: np.ndarray, ):
     plt.imshow(img)
     outputs = {}
     output_str = ''
-    for idx, (mask, rec_text, polygon, bbox) in enumerate(
-            zip(masks, rec_texts, line_polygons, det_bboxes)):
-        show_mask(mask.cpu(), plt.gca(), random_color=True)
+    for idx, (rec_text, polygon, bbox) in enumerate(
+            zip(matched_texts, line_polygons, det_bboxes)):
         polygon = np.array(polygon).reshape(-1, 2)
         # convert polygon to closed polygon
         polygon = np.concatenate([polygon, polygon[:1]], axis=0)
-        plt.plot(polygon[:, 0], polygon[:, 1], '--', color='b', linewidth=3)
+        plt.plot(polygon[:, 0], polygon[:, 1], '--', color='g', linewidth=2)
         # plot text on the left top corner of the polygon
         text_string = f'idx:{idx}, {rec_text}'
         bbox = bbox.cpu().numpy()
@@ -415,94 +397,17 @@ def run_mmocr_sam(img: np.ndarray, ):
             bbox[0],
             bbox[1],
             text_string,
-            color='c',
+            color='b',
             fontsize=13,
         )
         output_str += f'{idx}:{rec_text}' + '\n'
-        outputs[idx] = dict(
-            mask=mask.cpu().numpy().tolist(), polygon=polygon.tolist())
+        outputs[idx] = dict(polygon=polygon.tolist())
     plt.savefig('output.png')
     # convert plt to numpy
     img = cv2.cvtColor(
         np.array(plt.gcf().canvas.renderer._renderer), cv2.COLOR_RGB2BGR)
     plt.close()
     return img, output_str, outputs
-
-
-def run_erase(img: np.ndarray, mask_results, indexs: str, diffusion_type: str,
-              mask_type: str, dilate_iter: int):
-    """Run erase task
-
-    Args:
-        img (np.ndarray): Input image
-        mask_results (str): Mask results from SAM
-        indexs (str): Index of the selected text
-        diffusion_type (str): Type of the selected diffusion model.
-        mask_type (str): Type of the selected mask model.
-    """
-    # Diffuser
-    mask_results = eval(mask_results)
-    indexs = [int(idx) for idx in indexs.split(',')]
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    h, w, c, = img.shape
-    img = Image.fromarray(img)
-    ori_img_size = img.size
-    selected_mask = []
-    selected_polygons = []
-    for idx in indexs:
-        selected_mask.append(np.array(mask_results[idx]['mask']))
-        selected_polygons.append(np.array(mask_results[idx]['polygon']))
-    selected_mask = np.stack(selected_mask, axis=0)
-
-    if mask_type == 'SAM':
-        ori_mask = multi_mask2one_mask(masks=selected_mask)
-        # Dilate the mask region to promote the following erasing quality
-        mask_img = ori_mask[:, :, 0].astype('uint8')
-        kernel = np.ones((5, 5), np.int8)
-        whole_mask = cv2.dilate(mask_img, kernel, iterations=int(dilate_iter))
-    elif mask_type == 'MMOCR':
-        whole_mask = np.zeros((h, w, c), np.uint8)
-        for polygon in selected_polygons:
-            # expand the polygon with distance 0.1
-            expand_poly = offset_polygon(poly=polygon, distance=4).tolist()
-            px = [int(expand_poly[i]) for i in range(0, len(expand_poly), 2)]
-            py = [int(expand_poly[i]) for i in range(1, len(expand_poly), 2)]
-            poly = [[x, y] for x, y in zip(px, py)]
-            cv2.fillPoly(whole_mask, [np.array(poly)], (255, 255, 255))
-
-    if diffusion_type == 'Stable Diffusion':
-        pipe = StableDiffusionInpaintPipeline.from_pretrained(
-            'stabilityai/stable-diffusion-2-inpainting',
-            torch_dtype=torch.float16)
-        pipe = pipe.to('cuda')
-        img = img.resize((512, 512))
-        mask_img = numpy2PIL(numpy_image=whole_mask).convert("RGB").resize(
-            (512, 512))
-        prompt = "Just a background with no content"
-        result_img = pipe(
-            prompt=prompt, image=img, mask_image=mask_img).images[0]
-        result_img = result_img.resize(ori_img_size)
-
-    elif diffusion_type == 'Latent Diffusion':
-        config = OmegaConf.load("latent_diffusion/inpainting_big/config.yaml")
-        model = instantiate_from_config(config.model)
-        model.load_state_dict(
-            torch.load("checkpoints/ldm/last.ckpt")["state_dict"],
-            strict=False)
-        model = model.to('cuda')
-        mask_img = numpy2PIL(numpy_image=whole_mask)
-        result_img = erase_text_from_image(
-            img_path=img,
-            mask_pil_img=mask_img,
-            model=model,
-            device='cuda',
-            opt=None,
-            img_size=(512, 512),
-            steps=50)
-        result_img = result_img.resize(ori_img_size)
-
-    result_img = cv2.cvtColor(np.array(result_img), cv2.COLOR_RGB2BGR)
-    return result_img
 
 
 if __name__ == '__main__':
@@ -530,7 +435,6 @@ if __name__ == '__main__':
                     step=1,
                     label='The dilate iteration to dilate the SAM ouput mask',
                 )
-                downstream = gr.Button('Run Erasing')
                 
                 # Add a new button for mask-rotate-crop functionality
                 rotate_crop_btn = gr.Button('Rotate and Crop Text Areas')
@@ -552,16 +456,9 @@ if __name__ == '__main__':
                     inputs=input_image,
                 )
             mmocr_sam.click(
-                fn=run_mmocr_sam,
+                fn=run_text_recognition,
                 inputs=[input_image],
                 outputs=[output_image, sam_results, mask_results])
-            downstream.click(
-                fn=run_erase,
-                inputs=[
-                    input_image, mask_results, text_index, diffusion_type,
-                    mask_type, dilate_iter
-                ],
-                outputs=[output_image])
                 
             # Add function to handle rotate and crop functionality
             def process_rotate_crop(img, mask_results):
