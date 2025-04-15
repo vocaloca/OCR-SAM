@@ -88,10 +88,26 @@ Always prioritize visual cues such as alignment, positioning, grouping, orientat
 
 Your output should be the sequence of transcribed words arranged according to their inferred natural visual reading order.
 """
-# WORDS_ORDER_SYSTEM_PROMPT = """
-# You are an expert in words order.
-# Your task is to reorder the words in the correct order.
-# """
+
+FONT_ANALYSIS_USER_PROMPT = """
+what is the font color, outline and highlight colors of the text in the image?
+If there is a color gradient in the font color, select the average RGB color.
+Your answer should be in the following json format:
+{
+    "font color": <COLOR>,
+    "font color (RGB)": [R, G, B],
+    "outline color": <COLOR>,
+    "outline color (RGB)":  [R, G, B],
+    "highlight color exist": True/False,
+    "highlight color": <COLOR> or null
+    "highlight color (RGB)":  [R, G, B] or null,
+}
+"""
+FONT_ANALYSIS_SYSTEM_PROMPT = """
+You are an expert in font analysis.
+Your task is to analyze the font color, outline color and highlight color of the text in the image.
+Return the result in the following json format:
+"""
 
 
 def image_captioning(client: OpenAI, image: Union[str, Path, np.core.ndarray], prompt: str, system_prompt: str = "You are an AI assistant.", model: str = "gpt-4o") -> str:

@@ -234,7 +234,7 @@ def get_ocr_single_shot_results(img: np.core.ndarray):
     else:
         return []
 
-def get_text_or_language_from_img(img: np.core.ndarray, mode: Literal['ocr', 'ocr_count_lines', 'ocr_single_shot', 'ocr_single_line', 'language', 'words_order'], **kwargs):
+def get_text_or_language_from_img(img: np.core.ndarray, mode: Literal['ocr', 'ocr_count_lines', 'ocr_single_shot', 'ocr_single_line', 'language', 'words_order', 'font_analysis'], **kwargs):
     """Get text or language from (cropped) images
     """
     if mode == 'ocr':
@@ -256,6 +256,9 @@ def get_text_or_language_from_img(img: np.core.ndarray, mode: Literal['ocr', 'oc
         words = ", ".join(kwargs['words'])
         user_prompt = image_captioning.WORDS_ORDER_USER_PROMPT(words)
         system_prompt = image_captioning.WORDS_ORDER_SYSTEM_PROMPT
+    elif mode == 'font_analysis':
+        user_prompt = image_captioning.FONT_ANALYSIS_USER_PROMPT
+        system_prompt = image_captioning.FONT_ANALYSIS_SYSTEM_PROMPT
     else:
         raise ValueError(f"Invalid mode: {mode}")
     text = image_captioning.image_captioning(
@@ -349,9 +352,12 @@ def run_text_recognition(img: np.ndarray, det_polygons: Optional[List[BoxType]] 
         img, line_polygons, box_expansion=0.1
     )
     line_polygon_rec_texts = []
+    line_polygon_font_analysis = []
     for line_polygon_img in line_polygon_imgs:
         text = get_text_or_language_from_img(line_polygon_img['image'], mode='ocr_single_line')
+        font_analysis = get_text_or_language_from_img(line_polygon_img['image'], mode='font_analysis')
         line_polygon_rec_texts.append(text)
+        line_polygon_font_analysis.append(font_analysis)
     print(line_polygon_rec_texts)
     
     # Match each line_polygon to the rec_texts based on textual similarity
