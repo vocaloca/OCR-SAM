@@ -5,7 +5,7 @@ from io import BytesIO
 import logging
 import numpy as np
 from pathlib import Path
-from typing import Union
+from typing import Union, List
 from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
 from datetime import datetime
@@ -107,7 +107,48 @@ FONT_ANALYSIS_SYSTEM_PROMPT = """
 You are an expert in font analysis.
 Your task is to analyze the font color, outline color and highlight color of the text in the image.
 Return the result in the following json format:
+{{
+    "font color": <COLOR>,
+    "font color (RGB)": [R, G, B],
+    "outline color": <COLOR>,
+    "outline color (RGB)":  [R, G, B],
+    "highlight color exist": True/False,
+    "highlight color": <COLOR> or null
+    "highlight color (RGB)":  [R, G, B] or null,
+}}
+Do not add any explanations or additional text or other characters such as ```, escape characters, json, etc.
 """
+
+TRANSLATE_USER_PROMPT = lambda src_text_lines: f"""
+you are an AI text translator.
+Translate the following text to English.
+Do not add additional text, explanations, glossary or anything else other than the translated text.
+You'll need to follow the following steps:
+1. Concatenate the texts.
+2, Translate the entire text.
+3. Split back to {len(src_text_lines)} lines
+
+{src_text_lines}
+"""
+
+TRANSLATE_SYSTEM_PROMPT = """
+You are an AI text translator.
+Translate the following text to English.
+Do not add additional text, explanations, glossary or anything else other than the translated text.
+"""
+
+def translate_text(src_text_lines: List[str], llm_model: str = "gpt-4o") -> List[str]:
+    """
+    Translate the text to English.
+    """
+    client = OpenAI()
+    response = client.chat.completions.create(messages=[
+        {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT},
+        {"role": "user", "content": TRANSLATE_USER_PROMPT(src_text_lines)}
+    ],
+    model=llm_model,
+    )
+    return response.choices[0].message.content
 
 
 def image_captioning(client: OpenAI, image: Union[str, Path, np.core.ndarray], prompt: str, system_prompt: str = "You are an AI assistant.", model: str = "gpt-4o") -> str:

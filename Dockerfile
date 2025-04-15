@@ -14,6 +14,7 @@ RUN pip --no-cache-dir install git+https://github.com/facebookresearch/segment-a
 
 RUN pip --no-cache-dir install gradio==4.32.0 numpy omegaconf==2.3.0 einops==0.6.0 transformers==4.27.3 pytorch-lightning==2.0.1.post0 diffusers==0.14.0 diffusers==0.14.0 google-cloud-storage google-cloud-pubsub
 
+# TODO: check if this is still needed for ImageFont (not PyGObject)
 # # Multilingual text rendering - install system packages and then make PyGObject available to Python
 # RUN apt update && apt install -y \
 #     libcairo2-dev \

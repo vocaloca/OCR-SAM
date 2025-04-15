@@ -1,3 +1,5 @@
+import json
+import re
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple
 import cv2
@@ -20,6 +22,8 @@ from mmocr.utils.polygon_utils import offset_polygon
 
 # SAM
 from segment_anything import SamPredictor, sam_model_registry
+
+from linguana.language_utils_simplified import MultilingualTextRenderer
 
 
 
@@ -234,9 +238,36 @@ def get_ocr_single_shot_results(img: np.core.ndarray):
     else:
         return []
 
+
+def fix_json_none_values(json_dict):
+    for key, value in json_dict.items():
+        if value == 'none' or value == 'null' or value == 'None':
+            json_dict[key] = None
+    return json_dict
+
+def get_valid_json_from_llm(response_text):
+    # Try to extract JSON from the response if there's extra text
+    json_pattern = r'({.*})'
+    json_match = re.search(json_pattern, response_text, re.DOTALL)
+    
+    if json_match:
+        json_string = json_match.group(1)
+    else:
+        json_string = response_text
+    
+    try:
+        # Parse and validate the JSON
+        parsed_json = json.loads(json_string)
+        parsed_json = fix_json_none_values(parsed_json)
+        return parsed_json
+    except json.JSONDecodeError:
+        # Handle invalid JSON
+        return {"error": "Invalid JSON response", "raw_response": response_text}
+    
 def get_text_or_language_from_img(img: np.core.ndarray, mode: Literal['ocr', 'ocr_count_lines', 'ocr_single_shot', 'ocr_single_line', 'language', 'words_order', 'font_analysis'], **kwargs):
     """Get text or language from (cropped) images
     """
+    parse_json = False
     if mode == 'ocr':
         user_prompt = image_captioning.OCR_USER_PROMPT
         system_prompt = image_captioning.OCR_SYSTEM_PROMPT
@@ -259,14 +290,45 @@ def get_text_or_language_from_img(img: np.core.ndarray, mode: Literal['ocr', 'oc
     elif mode == 'font_analysis':
         user_prompt = image_captioning.FONT_ANALYSIS_USER_PROMPT
         system_prompt = image_captioning.FONT_ANALYSIS_SYSTEM_PROMPT
+        parse_json = True
     else:
         raise ValueError(f"Invalid mode: {mode}")
-    text = image_captioning.image_captioning(
-        client=OpenAI(), 
-        image=img, 
-        prompt=user_prompt,
-        system_prompt=system_prompt)  # noqa: E501
-    return text
+    
+    max_retries = 3
+    
+    while max_retries > 0:
+        text = image_captioning.image_captioning(
+            client=OpenAI(), 
+            image=img, 
+            prompt=user_prompt,
+            system_prompt=system_prompt)  # noqa: E501
+        if not parse_json:
+            return text
+        
+        try:
+            parsed_text = json.loads(text)
+            if kwargs.get('validate_keys', None) and not set(kwargs['validate_keys']).issubset(set(parsed_text.keys())):
+                logger.error(f"Invalid keys: {set(parsed_text.keys())} != {set(kwargs['validate_keys'])}")
+                max_retries -= 1
+                continue
+            parsed_text = fix_json_none_values(parsed_text)
+            return parsed_text
+        except json.JSONDecodeError:
+            try:
+                # Apply fallback parsing if direct parsing fails
+                parsed_text = get_valid_json_from_llm(text)
+                if kwargs.get('validate_keys', None) and not set(kwargs['validate_keys']).issubset(set(parsed_text.keys())):
+                    logger.error(f"Invalid keys: {set(parsed_text.keys())} != {set(kwargs['validate_keys'])}")
+                    max_retries -= 1
+                    continue
+                return parsed_text
+            except Exception as e:
+                logger.error(f"Error parsing JSON: {e}, trying again...")
+                max_retries -= 1
+                continue
+    
+    raise Exception("Failed to parse JSON (max_retries={})".format(max_retries))
+
 
 def parse_words_order(words: str):
     """Parse the words order from the string
@@ -279,7 +341,7 @@ def parse_words_order(words: str):
         words_order.append([word.strip() for word in words.split(',')])
     return words_order
 
-def run_text_recognition(img: np.ndarray, det_polygons: Optional[List[BoxType]] = None):
+def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons: Optional[List[BoxType]] = None):
     """Run MMOCR and SAM
 
     Args:
@@ -347,6 +409,38 @@ def run_text_recognition(img: np.ndarray, det_polygons: Optional[List[BoxType]] 
         np.array([poly2bbox(poly) for poly in line_polygons]),
         device='cuda')
 
+    # class LinePolygon:
+    #     def __init__(self, polygon, image):
+    #         self.polygon = polygon
+    #         self.image = image
+    #         self.text = None
+    #         self.font_analysis = None
+    #     @property
+    #     def text(self):
+    #         return self.text
+    #     @text.setter
+    #     def text(self, text):
+    #         self.text = text
+    #     @property
+    #     def polygon(self):
+    #         return self.polygon
+    #     @polygon.setter
+    #     def polygon(self, polygon):
+    #         self.polygon = polygon
+    #     @property
+    #     def image(self):
+    #         return self.image
+    #     @image.setter
+    #     def image(self, image):
+    #         self.image = image
+    #     @property
+    #     def font_analysis(self):
+    #         return self.font_analysis
+    #     @font_analysis.setter
+    #     def font_analysis(self, font_analysis):
+    #         self.font_analysis = font_analysis
+                    
+
     # TODO: match each line_polygon to the rec_texts, using API calls to ChatGPT-4o
     line_polygon_imgs = create_mask_rotate_crop(
         img, line_polygons, box_expansion=0.1
@@ -355,7 +449,8 @@ def run_text_recognition(img: np.ndarray, det_polygons: Optional[List[BoxType]] 
     line_polygon_font_analysis = []
     for line_polygon_img in line_polygon_imgs:
         text = get_text_or_language_from_img(line_polygon_img['image'], mode='ocr_single_line')
-        font_analysis = get_text_or_language_from_img(line_polygon_img['image'], mode='font_analysis')
+        font_analysis = get_text_or_language_from_img(line_polygon_img['image'], mode='font_analysis', 
+                                                      validate_keys=['font color (RGB)', 'outline color (RGB)', 'highlight color (RGB)', 'highlight color exist'])
         line_polygon_rec_texts.append(text)
         line_polygon_font_analysis.append(font_analysis)
     print(line_polygon_rec_texts)
@@ -380,6 +475,27 @@ def run_text_recognition(img: np.ndarray, det_polygons: Optional[List[BoxType]] 
     print("Line polygon texts:", line_polygon_rec_texts)
     print("Matched indices:", text_matches)
     print("Final matched texts:", matched_texts)
+    
+    # Render a new text on an erased image
+    renderer = MultilingualTextRenderer()
+    
+    matched_texts_translated = image_captioning.translate_text(matched_texts, "gpt-4o")
+    
+    image = erased_image.copy()
+    for idx, (translated_text, polygon, polygon_font) in enumerate(
+            zip(matched_texts_translated, line_polygons, line_polygon_font_analysis)):
+        
+        image = renderer.overlay_rotated_text(
+            image,
+            translated_text,
+            polygon,
+            font_size=24,  # TODO: fit to the polygon size
+            font_color=polygon_font["font color (RGB)"],
+            outline_color=polygon_font["outline color (RGB)"],
+            outline_width=2, # TODO: should have polygon_font["outline width"],
+            highlight_color=polygon_font["highlight color (RGB)"] if polygon_font["highlight color exist"] else None,
+            output_path='tmp_translated_text.png',  # TODO: remove this
+            )
     
     # Draw results
     plt.figure(figsize=(12, 12))
@@ -422,6 +538,7 @@ if __name__ == '__main__':
         with gr.Row():
             with gr.Column(scale=1):
                 input_image = gr.Image(label='Input Image')
+                erased_image = gr.Image(label='Erased Image')
                 sam_results = gr.Textbox(label='Detection Results')
                 mask_results = gr.Textbox(label='Mask Results', max_lines=2)
                 mmocr_sam = gr.Button('Run MMOCR and SAM')
@@ -463,7 +580,7 @@ if __name__ == '__main__':
                 )
             mmocr_sam.click(
                 fn=run_text_recognition,
-                inputs=[input_image],
+                inputs=[input_image, erased_image],
                 outputs=[output_image, sam_results, mask_results])
                 
             # Add function to handle rotate and crop functionality

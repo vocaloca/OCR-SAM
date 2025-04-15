@@ -12,7 +12,8 @@ def group_polygons_in_lines(polygons: List[np.ndarray],
                             num_lines: int = None,
                             drop_outliers: bool = True,
                             line_threshold_pct: float = 0.2,
-                            angle_threshold: float = 15):
+                            angle_threshold: float = 15,
+                            height_ratio_threshold: float = 3.0):
     """Group the polygons into text lines.
     
     This function takes a list of polygons (text bounding boxes) and groups them
@@ -28,6 +29,8 @@ def group_polygons_in_lines(polygons: List[np.ndarray],
         line_threshold_pct: Percentage of text height/width to use as threshold
         angle_threshold: Maximum angle difference (degrees) to consider polygons
                          aligned in the same line
+        height_ratio_threshold: Maximum allowed ratio between a box's height and
+                               the average height of a line (default: 3.0)
         
     Returns:
         Tuple of (line_groups, line_polygons) where:
@@ -75,13 +78,23 @@ def group_polygons_in_lines(polygons: List[np.ndarray],
         width = bbox[2] - bbox[0]
         height = bbox[3] - bbox[1]
         
+        # Correct width and height based on angle
+        # For rotated text, the axis-aligned bounding box will be larger than needed
+        # Apply rotation correction
+        angle_rad = np.radians(angle)
+        abs_cos = abs(np.cos(angle_rad))
+        abs_sin = abs(np.sin(angle_rad))
+        # Correct width and height (standard rotation correction formula)
+        corrected_width = width * abs_cos + height * abs_sin
+        corrected_height = width * abs_sin + height * abs_cos
+        
         box_features.append({
             'index': i,
             'polygon': polygon,
             'centroid': centroid,
             'angle': angle,
-            'width': width,
-            'height': height,
+            'width': corrected_width,
+            'height': corrected_height,
             'text': rec_texts[i] if i < len(rec_texts) else ''
         })
     
@@ -246,7 +259,7 @@ def group_polygons_in_lines(polygons: List[np.ndarray],
                 is_horizontal = abs(cluster_angle) < 45 or abs(cluster_angle) > 135
                 indices = [item['index'] for item in cluster]
                 filtered_indices = remove_outliers_from_line(
-                    indices, polygons, is_horizontal)
+                    indices, polygons, is_horizontal, height_ratio_threshold)
                 
                 # Update cluster to only contain boxes with indices in filtered_indices
                 cluster[:] = [item for item in cluster if item['index'] in filtered_indices]
@@ -337,7 +350,7 @@ def group_polygons_in_lines(polygons: List[np.ndarray],
             is_horizontal = abs(cluster_angle) < 45 or abs(cluster_angle) > 135
             indices = [item['index'] for item in cluster]
             filtered_indices = remove_outliers_from_line(
-                indices, polygons, is_horizontal)
+                indices, polygons, is_horizontal, height_ratio_threshold)
             
             # Update cluster to only contain boxes with indices in filtered_indices
             cluster[:] = [item for item in cluster if item['index'] in filtered_indices]
@@ -353,13 +366,16 @@ def group_polygons_in_lines(polygons: List[np.ndarray],
     return line_groups, line_polygons
 
 
-def remove_outliers_from_line(line_indices, polygons, is_horizontal):
+def remove_outliers_from_line(line_indices, polygons, is_horizontal, 
+                              height_ratio_threshold=3.0):
     """Remove outlier text boxes from a line based on position
     
     Args:
         line_indices: List of indices for boxes in this line
         polygons: List of all polygons
         is_horizontal: Whether text is primarily horizontal
+        height_ratio_threshold: Maximum allowed ratio between a box's height
+                              and the average height of a line (default: 3.0)
         
     Returns:
         Filtered list of indices with outliers removed
@@ -367,13 +383,20 @@ def remove_outliers_from_line(line_indices, polygons, is_horizontal):
     if len(line_indices) <= 3:  # Need enough data points
         return line_indices
         
-    # Get centroids for all polygons in the line
+    # Get centroids and heights for all polygons in the line
     centroids = []
+    heights = []
     for idx in line_indices:
         polygon = np.array(polygons[idx]).reshape(-1, 2)
         centroid = polygon.mean(axis=0)
         centroids.append(centroid)
         
+        # Calculate height from polygon bounds
+        bbox = poly2bbox(polygons[idx])
+        height = bbox[3] - bbox[1]
+        heights.append(height)
+        
+    # Filter outliers based on position
     # Choose coordinate based on text orientation
     # For horizontal text, we check vertical (y) outliers
     # For vertical text, we check horizontal (x) outliers
@@ -391,13 +414,30 @@ def remove_outliers_from_line(line_indices, polygons, is_horizontal):
     lower_bound = q1 - 1.5 * iqr
     upper_bound = q3 + 1.5 * iqr
     
-    # Filter out outliers
-    filtered_indices = []
+    # Filter out outliers based on position
+    position_filtered_indices = []
     for i, coord in enumerate(coords):
         if lower_bound <= coord <= upper_bound:
-            filtered_indices.append(line_indices[i])
-            
-    return filtered_indices if filtered_indices else line_indices  # Fallback
+            position_filtered_indices.append(i)
+    
+    # Now filter by height (only use position-filtered indices)
+    if len(position_filtered_indices) > 0:
+        # Get heights only from position-filtered boxes
+        filtered_heights = [heights[i] for i in position_filtered_indices]
+        avg_height = sum(filtered_heights) / len(filtered_heights)
+        
+        # Apply height filter (exclude boxes with height > threshold*avg or < avg/threshold)
+        final_filtered_indices = []
+        for i in position_filtered_indices:
+            if (avg_height / height_ratio_threshold <= heights[i] <= 
+                    avg_height * height_ratio_threshold):
+                final_filtered_indices.append(line_indices[i])
+                
+        if final_filtered_indices:
+            return final_filtered_indices
+    
+    # Fallback to original list if all filtered out
+    return line_indices
 
 
 def generate_line_polygons(lines, polygons):
@@ -452,7 +492,7 @@ def generate_line_polygons(lines, polygons):
 
 
 def match_text_to_lines(line_polygon_rec_texts: List[str], 
-                       rec_texts: List[str]) -> List[int]:
+                       rec_texts: List[str]):  # -> List[int]:
     """Match recognized texts from line polygons to original recognized texts
     based on textual similarity.
     

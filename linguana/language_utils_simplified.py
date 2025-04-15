@@ -1,11 +1,12 @@
-from PIL import Image, ImageDraw, ImageFont, ImageColor
-import math
+from typing import Union
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import math
 import os
 from fontTools.ttLib import TTFont
-from io import BytesIO
 import unicodedata
 from pathlib import Path
+import requests
 
 FONTS_DIR = Path(__file__).parent.parent.joinpath("fonts")
 
@@ -19,6 +20,11 @@ class MultilingualTextRenderer:
         """Initialize with a directory of font files"""
         self.fonts_dir = fonts_dir
         
+        # Ensure fonts directory exists
+        if not os.path.exists(self.fonts_dir):
+            os.makedirs(self.fonts_dir, exist_ok=True)
+            print(f"Created fonts directory at {self.fonts_dir}")
+        
         # Manual mapping of scripts to font files
         self.font_map = {
             'default': FONTS_DIR / "NotoSans-Regular.ttf",
@@ -31,11 +37,109 @@ class MultilingualTextRenderer:
             'arabic': FONTS_DIR / "NotoSansArabic-Regular.ttf"
         }
         
+        # Load or download required fonts for critical languages
+        self.load_critical_fonts(['japanese', 'chinese', 'korean'])
+        
         # Verify font files exist
         for script, font_path in self.font_map.items():
             if not font_path.exists():
                 print(f"Warning: Font for {script} not found at {font_path}")
         
+    def load_critical_fonts(self, languages):
+        """Ensure critical language fonts are available by downloading if needed"""
+        jp_url = 'https://github.com/googlefonts/noto-cjk/raw/main/'
+        jp_url += 'Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf'
+        
+        cn_url = 'https://github.com/googlefonts/noto-cjk/raw/main/'
+        cn_url += 'Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf'
+        
+        kr_url = 'https://github.com/googlefonts/noto-cjk/raw/main/'
+        kr_url += 'Sans/OTF/Korean/NotoSansCJKkr-Regular.otf'
+        
+        latin_url = 'https://github.com/googlefonts/noto-sans/raw/main/'
+        latin_url += 'fonts/NotoSans-Regular.ttf'
+        
+        font_urls = {
+            'japanese': jp_url,
+            'chinese': cn_url,
+            'korean': kr_url,
+            'latin': latin_url
+        }
+        
+        for lang in languages:
+            font_path = self.font_map.get(lang)
+            if font_path and not font_path.exists():
+                if lang in font_urls:
+                    try:
+                        print(f"Font for {lang} not found. Attempting to download...")
+                        self._download_font(font_urls[lang], font_path)
+                        print(f"Downloaded {lang} font to {font_path}")
+                    except Exception as e:
+                        print(f"Failed to download {lang} font: {e}")
+                        # Create an in-memory font as fallback
+                        self._create_fallback_font(lang)
+    
+    def _download_font(self, url, save_path):
+        """Download a font file from URL"""
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        # Make sure the directory exists
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save the font file
+        with open(save_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+    
+    def _create_fallback_font(self, language):
+        """Create an in-memory fallback font when download fails"""
+        # Map language to font object that will be stored in memory
+        self._memory_fonts = getattr(self, '_memory_fonts', {})
+        
+        # Try to use a system font as fallback
+        system_font = None
+        if language == 'japanese':
+            system_fonts = [
+                "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",  # macOS
+                "/System/Library/Fonts/AppleGothic.ttf",  # macOS
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"  # Linux
+            ]
+        elif language == 'chinese':
+            system_fonts = [
+                "/System/Library/Fonts/PingFang.ttc",  # macOS
+                "/System/Library/Fonts/STHeiti Light.ttc",  # macOS
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"  # Linux
+            ]
+        elif language == 'korean':
+            system_fonts = [
+                "/System/Library/Fonts/AppleSDGothicNeo.ttc",  # macOS
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"  # Linux
+            ]
+        else:
+            system_fonts = []
+            
+        # Try to load one of the system fonts
+        for font_path in system_fonts:
+            if os.path.exists(font_path):
+                system_font = font_path
+                print(f"Using system font for {language}: {font_path}")
+                break
+        
+        if system_font:
+            try:
+                # Test that we can load it
+                ImageFont.truetype(system_font, 12)  # Just test loading
+                # Store the path for later use
+                self._memory_fonts[language] = system_font
+            except Exception as e:
+                print(f"Error loading system font for {language}: {e}")
+                # Fall back to default
+                self._memory_fonts[language] = None
+        else:
+            self._memory_fonts[language] = None
+            print(f"No fallback font available for {language}")
+                
     def _build_font_map(self):
         """Build a map of script to available fonts"""
         font_map = {
@@ -174,6 +278,13 @@ class MultilingualTextRenderer:
         """Get appropriate font for the given text"""
         # Detect script of the text
         script = self.detect_script(text)
+        
+        # Check memory fonts first (for critical languages)
+        if hasattr(self, '_memory_fonts') and script in self._memory_fonts and self._memory_fonts[script]:
+            try:
+                return ImageFont.truetype(self._memory_fonts[script], size)
+            except Exception:
+                pass  # Continue to other methods if this fails
         
         # Special handling for CJK scripts and mixed text
         if script == 'default' or self.has_multiple_scripts(text):
@@ -332,7 +443,7 @@ class MultilingualTextRenderer:
     
     def overlay_rotated_text(
         self,
-        image_path,
+        image: Union[str, Path, Image.Image, np.core.ndarray],
         text,
         polygon,
         font_size=24,
@@ -340,63 +451,70 @@ class MultilingualTextRenderer:
         outline_color=None,
         outline_width=0,
         highlight_color=None,
-        output_path=None,
-        custom_font=None
+        output_path=None
     ):
         """
         Overlay text on an image within a rotated polygon with custom styling
         
         Args:
-            image_path: Path to the input image
+            image: Path to input image, PIL Image, or numpy array
             text: Text to overlay
-            polygon: List of (x,y) points defining the rotated bounding box
+            polygon: Flat list of 8 elements [x1,y1,x2,y2,x3,y3,x4,y4] defining the rotated bounding box
             font_size: Size of the font in points
             font_color: RGB tuple for the text color
             outline_color: RGB tuple for the outline color (None for no outline)
             outline_width: Width of the outline in pixels
             highlight_color: RGB tuple for background highlight (None for transparent)
             output_path: Path to save the result (if None, returns the image)
-            custom_font: Optional PIL ImageFont object to use instead of auto-selecting
             
         Returns:
             PIL Image with the overlaid text
         """
         # Load the image
-        img = Image.open(image_path).convert("RGBA")
+        if isinstance(image, np.core.ndarray):
+            img = Image.fromarray(image).convert("RGBA")
+        elif isinstance(image, str) or isinstance(image, Path):
+            img = Image.open(image).convert("RGBA")
+        elif isinstance(image, Image.Image):
+            img = image.convert("RGBA")
+        else:
+            raise ValueError(f"Unsupported image type: {type(image)}")
         img_width, img_height = img.size
         
+        # Convert flat polygon array to list of points
+        points = [(polygon[i], polygon[i+1]) for i in range(0, len(polygon), 2)]
+        
         # Calculate rotation angle from the polygon
-        dx = polygon[1][0] - polygon[0][0]
-        dy = polygon[1][1] - polygon[0][1]
+        dx = points[1][0] - points[0][0]
+        dy = points[1][1] - points[0][1]
         angle_degrees = math.degrees(math.atan2(dy, dx))
         
         # Calculate polygon dimensions
-        width = math.sqrt((polygon[1][0] - polygon[0][0])**2 + 
-                         (polygon[1][1] - polygon[0][1])**2)
-        height = math.sqrt((polygon[3][0] - polygon[0][0])**2 + 
-                          (polygon[3][1] - polygon[0][1])**2)
+        width = math.sqrt((points[1][0] - points[0][0])**2 + 
+                         (points[1][1] - points[0][1])**2)
+        height = math.sqrt((points[3][0] - points[0][0])**2 + 
+                          (points[3][1] - points[0][1])**2)
         
         # Calculate the centroid of the polygon
-        centroid_x = sum(p[0] for p in polygon) / len(polygon)
-        centroid_y = sum(p[1] for p in polygon) / len(polygon)
+        centroid_x = sum(p[0] for p in points) / len(points)
+        centroid_y = sum(p[1] for p in points) / len(points)
         
         # Draw highlight if needed
         if highlight_color is not None:
             highlight = Image.new('RGBA', img.size, (0, 0, 0, 0))
             draw = ImageDraw.Draw(highlight)
             
-            # Convert polygon to flat list for PIL
-            flat_polygon = [coord for point in polygon for coord in point]
+            # Use the flat polygon as is for PIL
             
             # Draw with alpha
             highlight_with_alpha = highlight_color + (180,)  # Add alpha
-            draw.polygon(flat_polygon, fill=highlight_with_alpha)
+            draw.polygon(polygon, fill=highlight_with_alpha)
             
             # Composite highlight onto the image
             img = Image.alpha_composite(img, highlight)
         
         # Get appropriate font
-        font = custom_font if custom_font else self.get_font_for_text(text, font_size)
+        font = self.get_font_for_text(text, font_size)
         
         # Create a transparent image for the text
         text_img = Image.new('RGBA', (int(width*1.5), int(height*1.5)), 
@@ -420,10 +538,10 @@ class MultilingualTextRenderer:
                     if dx == 0 and dy == 0:
                         continue  # Skip center (will be drawn in main color)
                     draw.text((text_x + dx, text_y + dy), text, font=font, 
-                             fill=outline_color)
+                             fill=tuple(outline_color))
         
         # Draw main text
-        draw.text((text_x, text_y), text, font=font, fill=font_color)
+        draw.text((text_x, text_y), text, font=font, fill=tuple(font_color))
         
         # Rotate the text
         rotated_text = text_img.rotate(-angle_degrees, resample=Image.BICUBIC, 
@@ -481,37 +599,16 @@ if __name__ == "__main__":
         print(f"\nProcessing {name} text...")
         print(f"Detected script: {renderer.detect_script(text)}")
         
-        # Direct font selection for CJK scripts
-        custom_font = None
-        if name in ["Japanese", "Korean", "Chinese"]:
-            script = name.lower()
-            font_path = renderer.font_map.get(script)
-            if font_path and font_path.exists():
-                try:
-                    print(f"Directly using {script} font: {font_path}")
-                    custom_font = ImageFont.truetype(str(font_path), 36)
-                except Exception as e:
-                    print(f"Error loading {script} font: {e}")
-        elif name == "Mixed":
-            # Use Japanese font for mixed text since it has good Unicode coverage
-            font_path = renderer.font_map.get('japanese')
-            if font_path and font_path.exists():
-                try:
-                    print(f"Using Japanese font for mixed text: {font_path}")
-                    custom_font = ImageFont.truetype(str(font_path), 36)
-                except Exception as e:
-                    print(f"Error loading Japanese font for mixed text: {e}")
-        
+        # Let the renderer handle font selection automatically
         output = renderer.overlay_rotated_text(
             "/data/projects/OCR-SAM/imgs/ex12.jpg",
             text,
             polygon,
-            font_size=36,
+            font_size=48,
             font_color=(0, 0, 255),
             outline_color=(255, 255, 255),
             outline_width=2,
             highlight_color=(255, 255, 0),
-            output_path=f"output_{name.lower()}.jpg",
-            custom_font=custom_font
+            output_path=f"output_{name.lower()}.jpg"
         )
         print(f"Rendered {name} text")
