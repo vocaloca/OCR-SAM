@@ -119,14 +119,14 @@ Return the result in the following json format:
 Do not add any explanations or additional text or other characters such as ```, escape characters, json, etc.
 """
 
-TRANSLATE_USER_PROMPT = lambda src_text_lines: f"""
+TRANSLATE_USER_PROMPT = lambda src_text_lines, target_language: f"""
 you are an AI text translator.
-Translate the following text to English.
+Translate the following text to {target_language} in {len(src_text_lines)} lines.
 Do not add additional text, explanations, glossary or anything else other than the translated text.
 You'll need to follow the following steps:
 1. Concatenate the texts.
 2, Translate the entire text.
-3. Split back to {len(src_text_lines)} lines
+3. Split the translated text to exactly {len(src_text_lines)} lines, separarated by newlines: {format_lines(len(src_text_lines))}
 
 {src_text_lines}
 """
@@ -137,14 +137,14 @@ Translate the following text to English.
 Do not add additional text, explanations, glossary or anything else other than the translated text.
 """
 
-def translate_text(src_text_lines: List[str], llm_model: str = "gpt-4o") -> List[str]:
+def translate_text(src_text_lines: List[str], target_language: str = "English", llm_model: str = "gpt-4o") -> List[str]:
     """
     Translate the text to English.
     """
     client = OpenAI()
     response = client.chat.completions.create(messages=[
         {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT},
-        {"role": "user", "content": TRANSLATE_USER_PROMPT(src_text_lines)}
+        {"role": "user", "content": TRANSLATE_USER_PROMPT(src_text_lines, target_language)}
     ],
     model=llm_model,
     )

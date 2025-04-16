@@ -7,6 +7,7 @@ from fontTools.ttLib import TTFont
 import unicodedata
 from pathlib import Path
 import requests
+import cv2
 
 FONTS_DIR = Path(__file__).parent.parent.joinpath("fonts")
 
@@ -483,32 +484,43 @@ class MultilingualTextRenderer:
         
         # Convert flat polygon array to list of points
         points = [(polygon[i], polygon[i+1]) for i in range(0, len(polygon), 2)]
+        points_np = np.array(points)
         
-        # Calculate rotation angle from the polygon
-        dx = points[1][0] - points[0][0]
-        dy = points[1][1] - points[0][1]
-        angle_degrees = math.degrees(math.atan2(dy, dx))
+        # Calculate center point (centroid) of the polygon
+        centroid_x = np.mean(points_np[:, 0])
+        centroid_y = np.mean(points_np[:, 1])
+        center = (centroid_x, centroid_y)
         
-        # Calculate polygon dimensions
-        width = math.sqrt((points[1][0] - points[0][0])**2 + 
-                         (points[1][1] - points[0][1])**2)
-        height = math.sqrt((points[3][0] - points[0][0])**2 + 
-                          (points[3][1] - points[0][1])**2)
+        # Get the minimum area rectangle using OpenCV
+        rect = cv2.minAreaRect(points_np.astype(np.int32))
+        _, (width, height), angle = rect
         
-        # Calculate the centroid of the polygon
-        centroid_x = sum(p[0] for p in points) / len(points)
-        centroid_y = sum(p[1] for p in points) / len(points)
+        # We'll use OpenCV's minAreaRect values directly to avoid 
+        # relying on the order of points in the polygon
+        
+        # Handle rotation to keep text right-side up
+        # OpenCV's minAreaRect returns angle in range [-90, 0)
+        if width < height:
+            angle += 90
+            width, height = height, width
+        
+        # Normalize angle to prevent upside-down text
+        if angle > 90:
+            angle -= 180
+        elif angle < -90:
+            angle += 180
+            
+        # # Center coordinates for text placement
+        # centroid_x, centroid_y = center
         
         # Draw highlight if needed
         if highlight_color is not None:
             highlight = Image.new('RGBA', img.size, (0, 0, 0, 0))
             draw = ImageDraw.Draw(highlight)
             
-            # Use the flat polygon as is for PIL
-            
             # Draw with alpha
             highlight_with_alpha = highlight_color + (180,)  # Add alpha
-            draw.polygon(polygon, fill=highlight_with_alpha)
+            draw.polygon(points, fill=highlight_with_alpha)
             
             # Composite highlight onto the image
             img = Image.alpha_composite(img, highlight)
@@ -518,7 +530,7 @@ class MultilingualTextRenderer:
         
         # Create a transparent image for the text
         text_img = Image.new('RGBA', (int(width*1.5), int(height*1.5)), 
-                           (0, 0, 0, 0))
+                            (0, 0, 0, 0))
         draw = ImageDraw.Draw(text_img)
         
         # Get text size
@@ -538,14 +550,14 @@ class MultilingualTextRenderer:
                     if dx == 0 and dy == 0:
                         continue  # Skip center (will be drawn in main color)
                     draw.text((text_x + dx, text_y + dy), text, font=font, 
-                             fill=tuple(outline_color))
+                              fill=tuple(outline_color))
         
         # Draw main text
         draw.text((text_x, text_y), text, font=font, fill=tuple(font_color))
         
         # Rotate the text
-        rotated_text = text_img.rotate(-angle_degrees, resample=Image.BICUBIC, 
-                                     expand=True)
+        rotated_text = text_img.rotate(-angle, resample=Image.BICUBIC, 
+                                      expand=True)
         
         # Calculate paste position
         paste_x = int(centroid_x - rotated_text.width / 2)
@@ -556,7 +568,7 @@ class MultilingualTextRenderer:
         
         # Convert back to RGB if needed for JPEG
         if output_path and (output_path.lower().endswith('.jpg') or 
-                           output_path.lower().endswith('.jpeg')):
+                            output_path.lower().endswith('.jpeg')):
             img = img.convert('RGB')
         
         # Save or return
@@ -565,6 +577,215 @@ class MultilingualTextRenderer:
             return output_path
         else:
             return img
+    
+    def calculate_optimal_font_size(
+        self, 
+        text, 
+        width, 
+        height, 
+        img_width, 
+        img_height,
+        angle,
+        centroid_x,
+        centroid_y,
+        min_font_size=8,
+        max_font_size=72,
+        vertical_margin=0.1,
+        horizontal_margin=0.1
+    ):
+        """
+        Calculate the optimal font size to fit text in a rotated rectangle
+        
+        Args:
+            text: Text to render
+            width: Width of the bounding rectangle
+            height: Height of the bounding rectangle
+            img_width: Width of the destination image
+            img_height: Height of the destination image
+            angle: Rotation angle in degrees
+            centroid_x: X coordinate of polygon centroid
+            centroid_y: Y coordinate of polygon centroid
+            min_font_size: Minimum acceptable font size
+            max_font_size: Maximum font size to try
+            vertical_margin: Vertical margin as fraction of height
+            horizontal_margin: Horizontal margin as fraction of width
+            
+        Returns:
+            optimal_font_size: The largest font size that fits within constraints
+        """
+        # Calculate available space with margins
+        available_width = width * (1 - horizontal_margin)
+        available_height = height * (1 - vertical_margin)
+        
+        # Binary search to find the optimal font size
+        low = min_font_size
+        high = max_font_size
+        optimal_font_size = min_font_size
+        
+        while low <= high:
+            mid = (low + high) // 2
+            font = self.get_font_for_text(text, mid)
+            
+            # Get text size
+            dummy_img = Image.new('RGB', (1, 1))
+            draw = ImageDraw.Draw(dummy_img)
+            text_bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+            
+            # Check if text fits within available space
+            if (text_height <= available_height and text_width <= available_width):
+                # This size works, try a larger one
+                optimal_font_size = mid
+                low = mid + 1
+            else:
+                # Too big, try a smaller one
+                high = mid - 1
+        
+        # Ensure the text doesn't exceed image dimensions
+        # Check if the rotated text would fit within image bounds
+        size_ok = False
+        while not size_ok and optimal_font_size > min_font_size:
+            # Create test text image
+            test_font = self.get_font_for_text(text, optimal_font_size)
+            
+            # Get text dimensions
+            test_img = Image.new('RGB', (1, 1))
+            test_draw = ImageDraw.Draw(test_img)
+            test_bbox = test_draw.textbbox((0, 0), text, font=test_font)
+            test_width = test_bbox[2] - test_bbox[0]
+            test_height = test_bbox[3] - test_bbox[1]
+            
+            # Create image with padding for rotation
+            test_img_with_text = Image.new('RGBA', 
+                (test_width + 20, test_height + 20), (0, 0, 0, 0))
+            test_draw_with_text = ImageDraw.Draw(test_img_with_text)
+            
+            # Position text in center
+            text_x = 10
+            text_y = 10
+            test_draw_with_text.text((text_x, text_y), text, 
+                                    font=test_font, fill=(0, 0, 0))
+            
+            # Rotate to check dimensions
+            rotated_test = test_img_with_text.rotate(-angle, 
+                                                    resample=Image.BICUBIC, 
+                                                    expand=True)
+            
+            # Calculate paste position
+            paste_x = int(centroid_x - rotated_test.width / 2)
+            paste_y = int(centroid_y - rotated_test.height / 2)
+            
+            # Check if it would fit within image bounds
+            if (paste_x < 0 or paste_y < 0 or 
+                paste_x + rotated_test.width > img_width or 
+                paste_y + rotated_test.height > img_height):
+                # Reduce size and try again
+                optimal_font_size -= 1
+            else:
+                # This size works
+                size_ok = True
+        
+        return optimal_font_size
+    
+    def overlay_fitted_text(
+        self,
+        image: Union[str, Path, Image.Image, np.core.ndarray],
+        text,
+        polygon,
+        max_font_size=72,
+        min_font_size=8,
+        vertical_margin=0.1,  # fraction of height
+        horizontal_margin=0.1,  # fraction of width
+        font_color=(0, 0, 0),
+        outline_color=None,
+        outline_width=0,
+        highlight_color=None,
+        output_path=None
+    ):
+        """
+        Overlay text on an image with automatic font size adjustment to fit the polygon
+        
+        Args:
+            image: Path to input image, PIL Image, or numpy array
+            text: Text to overlay
+            polygon: Flat list of 8 elements [x1,y1,x2,y2,x3,y3,x4,y4] defining the rotated bounding box
+            max_font_size: Maximum font size to try
+            min_font_size: Minimum font size to accept
+            vertical_margin: Fraction of polygon height to leave as margin (0.1 = 10%)
+            horizontal_margin: Fraction of polygon width to leave as margin (0.1 = 10%)
+            font_color: RGB tuple for the text color
+            outline_color: RGB tuple for the outline color (None for no outline)
+            outline_width: Width of the outline in pixels
+            highlight_color: RGB tuple for background highlight (None for transparent)
+            output_path: Path to save the result (if None, returns the image)
+            
+        Returns:
+            PIL Image with the overlaid text
+        """
+        # Load the image
+        if isinstance(image, np.core.ndarray):
+            img = Image.fromarray(image).convert("RGBA")
+        elif isinstance(image, str) or isinstance(image, Path):
+            img = Image.open(image).convert("RGBA")
+        elif isinstance(image, Image.Image):
+            img = image.convert("RGBA")
+        else:
+            raise ValueError(f"Unsupported image type: {type(image)}")
+        img_width, img_height = img.size
+        
+        # Convert flat polygon array to list of points
+        points = [(polygon[i], polygon[i+1]) for i in range(0, len(polygon), 2)]
+        points_np = np.array(points)
+        
+        # Calculate center point (centroid) of the polygon
+        centroid_x = np.mean(points_np[:, 0])
+        centroid_y = np.mean(points_np[:, 1])
+        
+        # Get the minimum area rectangle using OpenCV
+        rect = cv2.minAreaRect(points_np.astype(np.int32))
+        _, (width, height), angle = rect
+        
+        # Handle rotation to keep text right-side up
+        # OpenCV's minAreaRect returns angle in range [-90, 0)
+        if width < height:
+            angle += 90
+            width, height = height, width
+        
+        # Normalize angle to prevent upside-down text
+        if angle > 90:
+            angle -= 180
+        elif angle < -90:
+            angle += 180
+            
+        # Calculate optimal font size
+        optimal_font_size = self.calculate_optimal_font_size(
+            text, 
+            width, 
+            height, 
+            img_width, 
+            img_height,
+            angle,
+            centroid_x,
+            centroid_y,
+            min_font_size,
+            max_font_size,
+            vertical_margin,
+            horizontal_margin
+        )
+        
+        # Now we have the optimal font size, call the overlay_rotated_text method
+        return self.overlay_rotated_text(
+            image,
+            text,
+            polygon,
+            font_size=optimal_font_size,
+            font_color=font_color,
+            outline_color=outline_color,
+            outline_width=outline_width,
+            highlight_color=highlight_color,
+            output_path=output_path
+        )
 
 # Example usage
 if __name__ == "__main__":
@@ -572,7 +793,8 @@ if __name__ == "__main__":
     renderer = MultilingualTextRenderer()
     
     # Example polygon (rotated bounding box)
-    polygon = [(100, 100), (300, 150), (250, 250), (50, 200)]
+    # polygon = [(100, 100), (300, 150), (250, 250), (50, 200)]
+    polygon = [100, 100, 300, 150, 250, 250, 50, 200]
     
     # Test with different scripts
     examples = {
@@ -600,11 +822,14 @@ if __name__ == "__main__":
         print(f"Detected script: {renderer.detect_script(text)}")
         
         # Let the renderer handle font selection automatically
-        output = renderer.overlay_rotated_text(
+        output = renderer.overlay_fitted_text(
             "/data/projects/OCR-SAM/imgs/ex12.jpg",
             text,
             polygon,
-            font_size=48,
+            max_font_size=72,
+            min_font_size=8,
+            vertical_margin=0.1,
+            horizontal_margin=0.1,
             font_color=(0, 0, 255),
             outline_color=(255, 255, 255),
             outline_width=2,

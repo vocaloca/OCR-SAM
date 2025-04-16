@@ -330,6 +330,36 @@ def get_text_or_language_from_img(img: np.core.ndarray, mode: Literal['ocr', 'oc
     raise Exception("Failed to parse JSON (max_retries={})".format(max_retries))
 
 
+def find_font_size_for_height(target_height_px, text, font_path):
+    """Find the font size that makes text close to target height"""
+    min_size, max_size = 1, 100
+    best_size = min_size
+    best_diff = float('inf')
+    
+    # Binary search for optimal size
+    img = Image.new('RGB', (1, 1))
+    draw = ImageDraw.Draw(img)
+    
+    while min_size <= max_size:
+        mid_size = (min_size + max_size) // 2
+        font = ImageFont.truetype(font_path, mid_size)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        height = bbox[3] - bbox[1]
+        
+        diff = abs(height - target_height_px)
+        
+        if diff < best_diff:
+            best_diff = diff
+            best_size = mid_size
+        
+        if height < target_height_px:
+            min_size = mid_size + 1
+        else:
+            max_size = mid_size - 1
+    
+    return best_size
+
+
 def parse_words_order(words: str):
     """Parse the words order from the string
     """
@@ -453,6 +483,7 @@ def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons
                                                       validate_keys=['font color (RGB)', 'outline color (RGB)', 'highlight color (RGB)', 'highlight color exist'])
         line_polygon_rec_texts.append(text)
         line_polygon_font_analysis.append(font_analysis)
+        
     print(line_polygon_rec_texts)
     
     # Match each line_polygon to the rec_texts based on textual similarity
@@ -478,24 +509,57 @@ def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons
     
     # Render a new text on an erased image
     renderer = MultilingualTextRenderer()
-    
-    matched_texts_translated = image_captioning.translate_text(matched_texts, "gpt-4o")
+
+    translate_max_trials = 5
+    trial = 0
+    while trial < translate_max_trials:
+        try:
+            matched_texts_translated = image_captioning.translate_text(matched_texts, "English", "gpt-4o").split('\n')
+            if len(matched_texts_translated) != len(line_polygon_rec_texts):
+                raise Exception("Length mismatch")
+            break
+        except Exception as e:
+            trial += 1
+            logger.error(f"Error translating text: {e}, trying again...")
+    if trial == translate_max_trials:
+        raise Exception("Failed to translate text (max_trials={})".format(translate_max_trials))
+    # if less than len(line_polygon_rec_texts), fill in with empty strings
+    matched_texts_translated.extend([""] * (len(line_polygon_rec_texts) - len(matched_texts_translated)))
     
     image = erased_image.copy()
     for idx, (translated_text, polygon, polygon_font) in enumerate(
             zip(matched_texts_translated, line_polygons, line_polygon_font_analysis)):
         
-        image = renderer.overlay_rotated_text(
+        if translated_text == "":
+            # empty line, skip
+            continue
+        
+        # image = renderer.overlay_rotated_text(
+        #     image,
+        #     translated_text,
+        #     polygon,
+        #     font_size=24,  # TODO: fit to the polygon size
+        #     font_color=polygon_font["font color (RGB)"],
+        #     outline_color=polygon_font["outline color (RGB)"],
+        #     outline_width=2, # TODO: should have polygon_font["outline width"],
+        #     highlight_color=polygon_font["highlight color (RGB)"] if polygon_font["highlight color exist"] else None,
+        #     output_path='tmp_translated_text.png',  # TODO: remove this
+        #     )
+        
+        image = renderer.overlay_fitted_text(
             image,
             translated_text,
             polygon,
-            font_size=24,  # TODO: fit to the polygon size
+            max_font_size=128,
+            min_font_size=8,
+            vertical_margin=0.2,
+            horizontal_margin=0.1,
             font_color=polygon_font["font color (RGB)"],
             outline_color=polygon_font["outline color (RGB)"],
             outline_width=2, # TODO: should have polygon_font["outline width"],
             highlight_color=polygon_font["highlight color (RGB)"] if polygon_font["highlight color exist"] else None,
             output_path='tmp_translated_text.png',  # TODO: remove this
-            )
+        )
     
     # Draw results
     plt.figure(figsize=(12, 12))
@@ -529,7 +593,8 @@ def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons
     img = cv2.cvtColor(
         np.array(plt.gcf().canvas.renderer._renderer), cv2.COLOR_RGB2BGR)
     plt.close()
-    return img, output_str, outputs
+    # return img, output_str, outputs, image
+    return img, image
 
 
 if __name__ == '__main__':
@@ -539,33 +604,29 @@ if __name__ == '__main__':
             with gr.Column(scale=1):
                 input_image = gr.Image(label='Input Image')
                 erased_image = gr.Image(label='Erased Image')
-                sam_results = gr.Textbox(label='Detection Results')
-                mask_results = gr.Textbox(label='Mask Results', max_lines=2)
-                mmocr_sam = gr.Button('Run MMOCR and SAM')
-                text_index = gr.Textbox(
-                    label='Select Text Index. It can be multiple indices '
-                          'separated by commas.'
-                )
-                diffusion_type = gr.Radio(
-                    choices=['Stable Diffusion', 'Latent Diffusion'],
-                    label='Erasing Model')
-                mask_type = gr.Radio(
-                    choices=['SAM', 'MMOCR'], label='Mask Type')
-                dilate_iter = gr.Slider(
-                    1,
-                    5,
-                    value=2,
-                    step=1,
-                    label='The dilate iteration to dilate the SAM ouput mask',
-                )
-                
-                # Add a new button for mask-rotate-crop functionality
-                rotate_crop_btn = gr.Button('Rotate and Crop Text Areas')
+                replace_text = gr.Button('Run Text Replacement')
+                # text_index = gr.Textbox(
+                #     label='Select Text Index. It can be multiple indices '
+                #           'separated by commas.'
+                # )
+                # diffusion_type = gr.Radio(
+                #     choices=['Stable Diffusion', 'Latent Diffusion'],
+                #     label='Erasing Model')
+                # mask_type = gr.Radio(
+                #     choices=['SAM', 'MMOCR'], label='Mask Type')
+                # dilate_iter = gr.Slider(
+                #     1,
+                #     5,
+                #     value=2,
+                #     step=1,
+                #     label='The dilate iteration to dilate the SAM ouput mask',
+                # )
                 
             with gr.Column(scale=1):
                 output_image = gr.Image(label='Output Image')
                 # Add a gallery for displaying rotated crops
-                rotated_crops = gr.Gallery(label='Rotated Crops').style(grid=4)
+                text_analysis_image = gr.Image(label='Text Analysis Image')
+                
                 
                 gr.Markdown("## Image Examples")
                 gr.Examples(
@@ -578,10 +639,10 @@ if __name__ == '__main__':
                     ],
                     inputs=input_image,
                 )
-            mmocr_sam.click(
+            replace_text.click(
                 fn=run_text_recognition,
                 inputs=[input_image, erased_image],
-                outputs=[output_image, sam_results, mask_results])
+                outputs=[text_analysis_image, output_image])
                 
             # Add function to handle rotate and crop functionality
             def process_rotate_crop(img, mask_results):
@@ -599,17 +660,12 @@ if __name__ == '__main__':
                 # Convert results to a format suitable for the gallery
                 gallery_images = [result['image'] for result in results]
                 return gallery_images
-                
-            rotate_crop_btn.click(
-                fn=process_rotate_crop,
-                inputs=[input_image, mask_results],
-                outputs=[rotated_crops]
-            )
+            
 
     # Simple launch with minimal options to avoid pydantic schema generation issues
     demo.launch(
         debug=True,
         server_name="0.0.0.0", 
-        server_port=7860,
+        server_port=7861,
         show_api=False  # Disable API documentation to avoid schema generation
     )
