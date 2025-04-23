@@ -5,13 +5,14 @@ from io import BytesIO
 import logging
 import numpy as np
 from pathlib import Path
-from typing import Union, List
+from typing import Optional, Tuple, Union, List
 from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
 from datetime import datetime
 import matplotlib.pyplot as plt
 # Add these imports at the top with other imports
 import matplotlib.font_manager as fm
+from pydantic import BaseModel
 
 from linguana.gcp import delete_from_gcs, generate_signed_url, get_secret
 
@@ -71,6 +72,16 @@ Your task is to detect the language of the text in the image.
 Return the language code in ISO 639-1 format, or 'None' if no text is found.
 """
 
+TEXT_LANGUAGE_DETECTION_USER_PROMPT = lambda text: f"""
+Detect the language of the following text: {text}
+Return the language code in ISO 639-1 format, or 'None' if no text is found.
+"""
+TEXT_LANGUAGE_DETECTION_SYSTEM_PROMPT = """
+You are an expert in language detection.
+Your task is to detect the language of a given text.
+Return the language code in ISO 639-1 format, or 'None' if no text is found.
+"""
+
 WORDS_ORDER_USER_PROMPT = lambda words: f"""
 Given the image and the following transcribed words: {words}, determine their natural visual reading order based solely on the spatial layout of the image.
 
@@ -90,34 +101,49 @@ Your output should be the sequence of transcribed words arranged according to th
 """
 
 FONT_ANALYSIS_USER_PROMPT = """
-what is the font color, outline and highlight colors of the text in the image?
+what is the font color, outline, style and highlight colors of the text in the image?
 If there is a color gradient in the font color, select the average RGB color.
 Your answer should be in the following json format:
-{
-    "font color": <COLOR>,
-    "font color (RGB)": [R, G, B],
-    "outline color": <COLOR>,
-    "outline color (RGB)":  [R, G, B],
-    "highlight color exist": True/False,
-    "highlight color": <COLOR> or null
-    "highlight color (RGB)":  [R, G, B] or null,
-}
 """
 FONT_ANALYSIS_SYSTEM_PROMPT = """
 You are an expert in font analysis.
-Your task is to analyze the font color, outline color and highlight color of the text in the image.
+Your task is to analyze the font color, outline, style and highlight color of the text in the image.
 Return the result in the following json format:
-{{
-    "font color": <COLOR>,
-    "font color (RGB)": [R, G, B],
-    "outline color": <COLOR>,
-    "outline color (RGB)":  [R, G, B],
-    "highlight color exist": True/False,
-    "highlight color": <COLOR> or null
-    "highlight color (RGB)":  [R, G, B] or null,
-}}
 Do not add any explanations or additional text or other characters such as ```, escape characters, json, etc.
 """
+
+
+class FontAnalysisFormat(BaseModel):
+    font_color: str
+    font_color_rgb: List[int]
+    outline_color: str
+    outline_color_rgb: List[int]
+    outline_width: int
+    highlight_color_exist: bool
+    highlight_color: str
+    highlight_color_rgb: List[int]
+    font_style_italic: bool
+    font_style_bold: bool
+    font_style_underline: bool
+    font_style_strikethrough: bool
+    
+    class Config:
+        json_schema_extra = {
+            "properties": {
+                "font_color": {"type": "string"},
+                "font_color_rgb": {"type": "array", "items": {"type": "integer"}},
+                "outline_color": {"type": "string"},
+                "outline_color_rgb": {"type": "array", "items": {"type": "integer"}},
+                "outline_width": {"type": "integer"},
+                "highlight_color_exist": {"type": "boolean"},
+                "highlight_color": {"type": "string"},
+                "highlight_color_rgb": {"type": "array", "items": {"type": "integer"}},
+                "font_style_italic": {"type": "boolean"},
+                "font_style_bold": {"type": "boolean"},
+                "font_style_underline": {"type": "boolean"},
+                "font_style_strikethrough": {"type": "boolean"},
+            }
+        }
 
 TRANSLATE_USER_PROMPT = lambda src_text_lines, target_language: f"""
 you are an AI text translator.
@@ -131,27 +157,82 @@ You'll need to follow the following steps:
 {src_text_lines}
 """
 
-TRANSLATE_SYSTEM_PROMPT = """
+TRANSLATE_SYSTEM_PROMPT = lambda target_language: f"""
 You are an AI text translator.
-Translate the following text to English.
+Translate the following text to {target_language}.
 Do not add additional text, explanations, glossary or anything else other than the translated text.
 """
+TRANSLATE_USER_PROMPT_WITH_CONTEXT = lambda src_text_lines, target_language, context: f"""
+{TRANSLATE_USER_PROMPT(src_text_lines, target_language)}
 
-def translate_text(src_text_lines: List[str], target_language: str = "English", llm_model: str = "gpt-4o") -> List[str]:
+Use the following context to help you translate the text:
+{context}
+"""
+
+def translate_text(src_text_lines: List[str], target_language: str = "English", llm_model: str = "gpt-4o", pass_through_english: bool = True, context: Optional[str] = None):  # -> List[str]:
     """
     Translate the text to English.
     """
     client = OpenAI()
-    response = client.chat.completions.create(messages=[
-        {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT},
-        {"role": "user", "content": TRANSLATE_USER_PROMPT(src_text_lines, target_language)}
-    ],
-    model=llm_model,
-    )
-    return response.choices[0].message.content
+    
+    # if the language of any of the src_text_lines is English, translate it to English first, and then to the target language
+    translate_to_english = False
+    if pass_through_english:
+        for line in src_text_lines:
+            
+            response = client.chat.completions.create(messages=[
+                {"role": "system", "content": TEXT_LANGUAGE_DETECTION_USER_PROMPT(line)},
+                {"role": "user", "content": TEXT_LANGUAGE_DETECTION_SYSTEM_PROMPT}
+            ],
+            model=llm_model,
+            )
+            if response.choices[0].message.content.strip().lower() != "english":
+                translate_to_english = True
+                break
+    
+    if translate_to_english and target_language != "English":
+    
+        response_en_text = client.chat.completions.create(messages=[
+            {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT("English")},
+            {"role": "user", "content": TRANSLATE_USER_PROMPT(src_text_lines, "English") if context is None else TRANSLATE_USER_PROMPT_WITH_CONTEXT(src_text_lines, "English", context)}
+        ],
+        model=llm_model,
+        ).choices[0].message.content
+        response_en_text = list(map(lambda x: x.strip(), response_en_text.split('\n')))
+        
+        
+        context_en = client.chat.completions.create(messages=[
+            {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT("English")},
+            {"role": "user", "content": TRANSLATE_USER_PROMPT(context.split('\n'), "English") if context is not None else TRANSLATE_USER_PROMPT(context.split('\n'), "English")}
+        ],
+        model=llm_model,
+        ).choices[0].message.content
+        # context_en = list(map(lambda x: x.strip(), context_en.split('\n')))
+        
+        response_target_text = client.chat.completions.create(messages=[
+            {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT(target_language)},
+            {"role": "user", "content": TRANSLATE_USER_PROMPT(response_en_text, target_language) if context is None else TRANSLATE_USER_PROMPT_WITH_CONTEXT(response_en_text, target_language, context_en)}
+        ],
+        model=llm_model,
+        ).choices[0].message.content
+    else:
+        response_target_text = client.chat.completions.create(messages=[
+            {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT(target_language)},
+            {"role": "user", "content": TRANSLATE_USER_PROMPT(src_text_lines, target_language) if context is None else TRANSLATE_USER_PROMPT_WITH_CONTEXT(src_text_lines, target_language, context)}
+        ],
+        model=llm_model,
+        ).choices[0].message.content
+        
+    return response_target_text
 
 
-def image_captioning(client: OpenAI, image: Union[str, Path, np.core.ndarray], prompt: str, system_prompt: str = "You are an AI assistant.", model: str = "gpt-4o") -> str:
+def image_captioning(
+    client: OpenAI, 
+    image: Union[str, Path, np.core.ndarray], 
+    prompt: str, system_prompt: str = "You are an AI assistant.", 
+    model: str = "gpt-4o", 
+    response_format: Optional[BaseModel] = None, 
+    ) -> str:
     """
     Generate a caption for an image using OpenAI's GPT-4 model.
     """
@@ -180,19 +261,33 @@ def image_captioning(client: OpenAI, image: Union[str, Path, np.core.ndarray], p
     else:
         raise ValueError(f"Invalid image path: {image}")
 
-    # API request
-    response = client.chat.completions.create(messages=[
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": image}
-        ]}
-    ],
-    model=model,
-    )
-
+    if response_format is not None:
+        response = client.beta.chat.completions.parse(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": image}
+                    ]
+                 },
+                ],
+            response_format=response_format,
+        )
+    else:
+        # API request
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": image}
+                    ]
+                 },
+                ],
+        )
     return response.choices[0].message.content
-
 
 
 def image_editing_prompt(prompt: str, llm_model: str = "gpt-4o", masked_image=None, target_img_caption=True, max_retries: int = 3):
@@ -278,72 +373,6 @@ def image_editing_prompt(prompt: str, llm_model: str = "gpt-4o", masked_image=No
 
 
 
-if __name__ == "__main__":
-
-    OPENAI_API_KEY_PROJECT_ID = "357470755328"
-    OPENAI_API_KEY_SECRET_ID =  "image-eraser-openai"
-    from linguana.gcp import get_secret
-
-    os.environ["OPENAI_API_KEY"] = get_secret(OPENAI_API_KEY_PROJECT_ID, OPENAI_API_KEY_SECRET_ID)
-    
-    BUCKET_NAME = "linguana-models"
-    
-    # Create timestamped directory for results
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_dir = Path("/data/projects/OCR-SAM/captioning_" + timestamp)
-    results_dir.mkdir(exist_ok=True)
-    
-    for img_path in Path("/data/projects/OCR-SAM/det_polygon_imgs").glob("*.png"):
-        image_caption = image_captioning(
-            client=OpenAI(), 
-            image=img_path, 
-            prompt="Extract and recognize any text in the image. If no text is found, return 'None'. Do not add any explanations or additional text.",
-            system_prompt="You are an expert in text recognition and OCR. Your task is to extract and recognize text from images, including non-Latin scripts like Arabic, Japanese, Korean, etc. Return only the recognized text exactly as it appears, or 'None' if no text is found.")  # noqa: E501
-        # overlay the caption on the image and save to the results directory with original filename
-        image = Image.open(img_path)
-        # draw = ImageDraw.Draw(image)
-        # # Use a font that supports multiple languages
-        # try:
-        #     # Try to use a font that supports multiple languages
-        #     font = ImageFont.truetype("Arial Unicode MS", 20)  # Windows
-        # except (OSError, IOError):
-        #     try:
-        #         font = ImageFont.truetype("/System/Library/Fonts/STHeiti Light.ttc", 20)  # macOS
-        #     except (OSError, IOError):
-        #         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)  # Linux
-        # draw.text((10, 10), image_caption, fill="red", font=font)
-        # Save to results directory with original filename
-        image.save(results_dir / img_path.with_stem(f"{img_path.stem}__{image_caption}").name)
-        # print(image_caption)
-        
-        
-    # client = OpenAI()
-    # # local file
-    # response = image_captioning(client, "/data/projects/image-eraser/imgs/erase_2.jpg", "I want to remove the text using latent diffusion model. Describe the background to be filled in a single sentence.")
-    # print(response)
-    
-    # Try image editing prompt
-    from PIL import Image
-    image_caption = image_captioning(
-        client=OpenAI(), 
-        image=Path("/data/projects/image-eraser-data/tmp/thumbs_30075095401_hq.png"), 
-        prompt="Describe the image in a single or couple of sentences.")  # noqa: E501
-    masked_image = Image.open("/data/projects/image-eraser-data/tmp/thumbs_30075095401_hq__masked.png")
-    
-    image_caption, image_inpainting_prompt = image_editing_prompt(
-        prompt=image_caption, 
-        llm_model="gpt-4o", 
-        masked_image=masked_image, 
-        target_img_caption=True)
-    
-    
-    # image url
-    response = image_captioning(
-        client=OpenAI(), 
-        image="https://images.unsplash.com/photo-1598966835412-6de6f92c243d?q=80&w=2283&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D", 
-        prompt="I want to remove the text using latent diffusion model. Describe the background to be filled in a single sentence.")
-    print(response)
-
 
 # Add this configuration after the logger setup but before any plotting code (around line 40-50)
 # Configure matplotlib to use fonts that support multiple languages
@@ -425,3 +454,116 @@ def configure_multilingual_fonts():
     
     # Enable Unicode minus sign
     plt.rcParams['axes.unicode_minus'] = False
+    
+    # add all Latin fonts under fonts directory
+    for font_file in (Path(__file__).parent / "fonts/ArchivoNarrow").glob("*.ttf"):
+        try:
+            fm.fontManager.addfont(str(font_file))
+        except Exception:
+            pass
+
+
+def extract_context_from_srt(srt_path: Union[str, Path]):  # -> str:
+    """
+    Extract only the subtitle text from an SRT file.
+    
+    Args:
+        srt_path: Path to the SRT file
+        
+    Returns:
+        A string containing only the subtitle texts joined with newlines
+    """
+    srt_path = Path(srt_path) if isinstance(srt_path, str) else srt_path
+    subtitles = []
+    with srt_path.open("r", encoding="utf-8") as f:
+        content = f.read()
+    
+    # Use regex to match SRT entries
+    import re
+    # Pattern matches: number, timestamp, and subtitle text (handles various line break formats)
+    pattern = r'(\d+)\s*\n(\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3})\s*\n(.*?)(?=\n\s*\d+\s*\n\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*|$)'
+    matches = re.findall(pattern, content, re.DOTALL)
+    
+    for _, _, subtitle_text in matches:
+        # Clean up the subtitle text
+        cleaned_text = subtitle_text.strip()
+        
+        # TODO: check if it helps to remove speaker tag
+        # Remove speaker tag if present
+        if "##speaker_" in cleaned_text:
+            cleaned_text = cleaned_text.split("##speaker_")[0].strip()
+        
+        subtitles.append(cleaned_text)
+    
+    return "\n".join(subtitles)
+
+
+if __name__ == "__main__":
+    
+    print(extract_context_from_srt("/data/projects/OCR-SAM/v1.0.0/subtitles/subtitles_30065059574.srt"))
+    
+    # OPENAI_API_KEY_PROJECT_ID = "357470755328"
+    # OPENAI_API_KEY_SECRET_ID =  "image-eraser-openai"
+    # from linguana.gcp import get_secret
+
+    # os.environ["OPENAI_API_KEY"] = get_secret(OPENAI_API_KEY_PROJECT_ID, OPENAI_API_KEY_SECRET_ID)
+    
+    # BUCKET_NAME = "linguana-models"
+    
+    # # Create timestamped directory for results
+    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # results_dir = Path("/data/projects/OCR-SAM/captioning_" + timestamp)
+    # results_dir.mkdir(exist_ok=True)
+    
+    # for img_path in Path("/data/projects/OCR-SAM/det_polygon_imgs").glob("*.png"):
+    #     image_caption = image_captioning(
+    #         client=OpenAI(), 
+    #         image=img_path, 
+    #         prompt="Extract and recognize any text in the image. If no text is found, return 'None'. Do not add any explanations or additional text.",
+    #         system_prompt="You are an expert in text recognition and OCR. Your task is to extract and recognize text from images, including non-Latin scripts like Arabic, Japanese, Korean, etc. Return only the recognized text exactly as it appears, or 'None' if no text is found.")  # noqa: E501
+    #     # overlay the caption on the image and save to the results directory with original filename
+    #     image = Image.open(img_path)
+    #     # draw = ImageDraw.Draw(image)
+    #     # # Use a font that supports multiple languages
+    #     # try:
+    #     #     # Try to use a font that supports multiple languages
+    #     #     font = ImageFont.truetype("Arial Unicode MS", 20)  # Windows
+    #     # except (OSError, IOError):
+    #     #     try:
+    #     #         font = ImageFont.truetype("/System/Library/Fonts/STHeiti Light.ttc", 20)  # macOS
+    #     #     except (OSError, IOError):
+    #     #         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)  # Linux
+    #     # draw.text((10, 10), image_caption, fill="red", font=font)
+    #     # Save to results directory with original filename
+    #     image.save(results_dir / img_path.with_stem(f"{img_path.stem}__{image_caption}").name)
+    #     # print(image_caption)
+        
+        
+    # # client = OpenAI()
+    # # # local file
+    # # response = image_captioning(client, "/data/projects/image-eraser/imgs/erase_2.jpg", "I want to remove the text using latent diffusion model. Describe the background to be filled in a single sentence.")
+    # # print(response)
+    
+    # # Try image editing prompt
+    # from PIL import Image
+    # image_caption = image_captioning(
+    #     client=OpenAI(), 
+    #     image=Path("/data/projects/image-eraser-data/tmp/thumbs_30075095401_hq.png"), 
+    #     prompt="Describe the image in a single or couple of sentences.")  # noqa: E501
+    # masked_image = Image.open("/data/projects/image-eraser-data/tmp/thumbs_30075095401_hq__masked.png")
+    
+    # image_caption, image_inpainting_prompt = image_editing_prompt(
+    #     prompt=image_caption, 
+    #     llm_model="gpt-4o", 
+    #     masked_image=masked_image, 
+    #     target_img_caption=True)
+    
+    
+    # # image url
+    # response = image_captioning(
+    #     client=OpenAI(), 
+    #     image="https://images.unsplash.com/photo-1598966835412-6de6f92c243d?q=80&w=2283&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D", 
+    #     prompt="I want to remove the text using latent diffusion model. Describe the background to be filled in a single sentence.")
+    # print(response)
+
+    

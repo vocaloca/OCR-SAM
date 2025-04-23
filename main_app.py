@@ -36,6 +36,9 @@ from latent_diffusion.ldm_erase_text import (
 MODEL_FOLDER = Path(__file__).parent / 'checkpoints'
 
 BoxType = Tuple[float, float, float, float, float, float, float, float]  # x1, y1, x2, y2, x3, y3, x4, y4
+ModelType = Literal['gpt-4o-2024-11-20', 'gpt-4o-2024-08-06', 'gpt-4o-2024-05-13']
+CaptionType = Literal['ocr', 'ocr_count_lines', 'ocr_single_shot', 'ocr_single_line', 'language', 'words_order', 'font_analysis']
+
 
 # Call the configuration function
 image_captioning.configure_multilingual_fonts()
@@ -221,7 +224,7 @@ def create_mask_rotate_crop(
     
     return results
 
-def get_ocr_single_shot_results(img: np.core.ndarray):
+def get_ocr_single_shot_results(img: np.core.ndarray, target_language: str = "English"):
     """Get OCR results from an image using a single shot approach
     """
     try:
@@ -247,7 +250,7 @@ def fix_json_none_values(json_dict):
 
 def get_valid_json_from_llm(response_text):
     # Try to extract JSON from the response if there's extra text
-    json_pattern = r'({.*})'
+    json_pattern = r'({[\s\S]*})'  # More robust pattern to match across multiple lines
     json_match = re.search(json_pattern, response_text, re.DOTALL)
     
     if json_match:
@@ -257,17 +260,32 @@ def get_valid_json_from_llm(response_text):
     
     try:
         # Parse and validate the JSON
+        # First attempt direct parsing
         parsed_json = json.loads(json_string)
         parsed_json = fix_json_none_values(parsed_json)
         return parsed_json
-    except json.JSONDecodeError:
-        # Handle invalid JSON
-        return {"error": "Invalid JSON response", "raw_response": response_text}
-    
-def get_text_or_language_from_img(img: np.core.ndarray, mode: Literal['ocr', 'ocr_count_lines', 'ocr_single_shot', 'ocr_single_line', 'language', 'words_order', 'font_analysis'], **kwargs):
+    except json.JSONDecodeError as e:
+        # Try to clean the string if direct parsing fails
+        try:
+            # Remove any potential unicode characters or unexpected whitespace
+            cleaned_string = json_string.strip()
+            # Try replacing single quotes with double quotes for JSON compatibility
+            if "'" in cleaned_string and '"' not in cleaned_string:
+                cleaned_string = cleaned_string.replace("'", '"')
+            # Try parsing the cleaned string
+            parsed_json = json.loads(cleaned_string)
+            parsed_json = fix_json_none_values(parsed_json)
+            return parsed_json
+        except json.JSONDecodeError:
+            # If all parsing attempts fail, return an error object
+            logger.error(f"JSON decode error: {str(e)}, raw string: {json_string[:100]}...")
+            return {"error": "Invalid JSON response", "raw_response": response_text}
+
+def get_text_or_language_from_img(img: np.core.ndarray, mode: CaptionType, model: ModelType = "gpt-4o-2024-08-06", **kwargs):
     """Get text or language from (cropped) images
     """
-    parse_json = False
+    # parse_json = False
+    response_format = None
     if mode == 'ocr':
         user_prompt = image_captioning.OCR_USER_PROMPT
         system_prompt = image_captioning.OCR_SYSTEM_PROMPT
@@ -290,45 +308,23 @@ def get_text_or_language_from_img(img: np.core.ndarray, mode: Literal['ocr', 'oc
     elif mode == 'font_analysis':
         user_prompt = image_captioning.FONT_ANALYSIS_USER_PROMPT
         system_prompt = image_captioning.FONT_ANALYSIS_SYSTEM_PROMPT
-        parse_json = True
+        response_format = image_captioning.FontAnalysisFormat
     else:
         raise ValueError(f"Invalid mode: {mode}")
     
-    max_retries = 3
-    
-    while max_retries > 0:
-        text = image_captioning.image_captioning(
+    text = image_captioning.image_captioning(
             client=OpenAI(), 
+            model=model,
             image=img, 
             prompt=user_prompt,
-            system_prompt=system_prompt)  # noqa: E501
-        if not parse_json:
-            return text
-        
-        try:
-            parsed_text = json.loads(text)
-            if kwargs.get('validate_keys', None) and not set(kwargs['validate_keys']).issubset(set(parsed_text.keys())):
-                logger.error(f"Invalid keys: {set(parsed_text.keys())} != {set(kwargs['validate_keys'])}")
-                max_retries -= 1
-                continue
-            parsed_text = fix_json_none_values(parsed_text)
-            return parsed_text
-        except json.JSONDecodeError:
-            try:
-                # Apply fallback parsing if direct parsing fails
-                parsed_text = get_valid_json_from_llm(text)
-                if kwargs.get('validate_keys', None) and not set(kwargs['validate_keys']).issubset(set(parsed_text.keys())):
-                    logger.error(f"Invalid keys: {set(parsed_text.keys())} != {set(kwargs['validate_keys'])}")
-                    max_retries -= 1
-                    continue
-                return parsed_text
-            except Exception as e:
-                logger.error(f"Error parsing JSON: {e}, trying again...")
-                max_retries -= 1
-                continue
+            system_prompt=system_prompt,
+            response_format=response_format
+            ) 
+    # TODO: remove when done testing
+    if response_format is not None:
+        text = get_valid_json_from_llm(text)
+    return text
     
-    raise Exception("Failed to parse JSON (max_retries={})".format(max_retries))
-
 
 def find_font_size_for_height(target_height_px, text, font_path):
     """Find the font size that makes text close to target height"""
@@ -338,7 +334,7 @@ def find_font_size_for_height(target_height_px, text, font_path):
     
     # Binary search for optimal size
     img = Image.new('RGB', (1, 1))
-    draw = ImageDraw.Draw(img)
+    draw = Image.Draw(img)
     
     while min_size <= max_size:
         mid_size = (min_size + max_size) // 2
@@ -371,7 +367,7 @@ def parse_words_order(words: str):
         words_order.append([word.strip() for word in words.split(',')])
     return words_order
 
-def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons: Optional[List[BoxType]] = None):
+def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, target_language: str = "English", srt_file_path: Optional[str] = None, det_polygons: Optional[List[BoxType]] = None):
     """Run MMOCR and SAM
 
     Args:
@@ -419,7 +415,7 @@ def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons
         
         # Draw the line's bounding polygon
         if len(line) > 0:
-            line_polygon_points = line_polygon.reshape(-1, 2)
+            line_polygon_points = np.array(line_polygon).reshape(-1, 2)
             line_polygon_points = np.concatenate([line_polygon_points, line_polygon_points[:1]], axis=0)
             plt.plot(line_polygon_points[:, 0], line_polygon_points[:, 1], '-', 
                      color=line_color, linewidth=3, alpha=0.7)
@@ -439,36 +435,6 @@ def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons
         np.array([poly2bbox(poly) for poly in line_polygons]),
         device='cuda')
 
-    # class LinePolygon:
-    #     def __init__(self, polygon, image):
-    #         self.polygon = polygon
-    #         self.image = image
-    #         self.text = None
-    #         self.font_analysis = None
-    #     @property
-    #     def text(self):
-    #         return self.text
-    #     @text.setter
-    #     def text(self, text):
-    #         self.text = text
-    #     @property
-    #     def polygon(self):
-    #         return self.polygon
-    #     @polygon.setter
-    #     def polygon(self, polygon):
-    #         self.polygon = polygon
-    #     @property
-    #     def image(self):
-    #         return self.image
-    #     @image.setter
-    #     def image(self, image):
-    #         self.image = image
-    #     @property
-    #     def font_analysis(self):
-    #         return self.font_analysis
-    #     @font_analysis.setter
-    #     def font_analysis(self, font_analysis):
-    #         self.font_analysis = font_analysis
                     
 
     # TODO: match each line_polygon to the rec_texts, using API calls to ChatGPT-4o
@@ -479,8 +445,7 @@ def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons
     line_polygon_font_analysis = []
     for line_polygon_img in line_polygon_imgs:
         text = get_text_or_language_from_img(line_polygon_img['image'], mode='ocr_single_line')
-        font_analysis = get_text_or_language_from_img(line_polygon_img['image'], mode='font_analysis', 
-                                                      validate_keys=['font color (RGB)', 'outline color (RGB)', 'highlight color (RGB)', 'highlight color exist'])
+        font_analysis = get_text_or_language_from_img(line_polygon_img['image'], mode='font_analysis')
         line_polygon_rec_texts.append(text)
         line_polygon_font_analysis.append(font_analysis)
         
@@ -514,7 +479,17 @@ def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons
     trial = 0
     while trial < translate_max_trials:
         try:
-            matched_texts_translated = image_captioning.translate_text(matched_texts, "English", "gpt-4o").split('\n')
+            # Handle the TemporaryFileWrapper object if present
+            srt_path = None
+            if srt_file_path:
+                # Check if it's a TemporaryFileWrapper (from gradio File component)
+                if hasattr(srt_file_path, 'name'):
+                    srt_path = srt_file_path.name
+                else:
+                    srt_path = srt_file_path
+                    
+            context = image_captioning.extract_context_from_srt(srt_path) if srt_path else None
+            matched_texts_translated = image_captioning.translate_text(matched_texts, target_language, "gpt-4o", context=context).split('\n')
             if len(matched_texts_translated) != len(line_polygon_rec_texts):
                 raise Exception("Length mismatch")
             break
@@ -527,6 +502,13 @@ def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons
     matched_texts_translated.extend([""] * (len(line_polygon_rec_texts) - len(matched_texts_translated)))
     
     image = erased_image.copy()
+    
+    # Collect all polygons to check for overlaps
+    all_polygons = line_polygons.copy()
+    
+    # Track polygon updates for rendering
+    updated_polygons = []
+    
     for idx, (translated_text, polygon, polygon_font) in enumerate(
             zip(matched_texts_translated, line_polygons, line_polygon_font_analysis)):
         
@@ -534,32 +516,42 @@ def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons
             # empty line, skip
             continue
         
-        # image = renderer.overlay_rotated_text(
-        #     image,
-        #     translated_text,
-        #     polygon,
-        #     font_size=24,  # TODO: fit to the polygon size
-        #     font_color=polygon_font["font color (RGB)"],
-        #     outline_color=polygon_font["outline color (RGB)"],
-        #     outline_width=2, # TODO: should have polygon_font["outline width"],
-        #     highlight_color=polygon_font["highlight color (RGB)"] if polygon_font["highlight color exist"] else None,
-        #     output_path='tmp_translated_text.png',  # TODO: remove this
-        #     )
-        
-        image = renderer.overlay_fitted_text(
+        # Use the updated function that can resize polygons
+        image_result, new_polygons = renderer.overlay_fitted_text(
             image,
             translated_text,
             polygon,
-            max_font_size=128,
+            max_font_size=200,
             min_font_size=8,
-            vertical_margin=0.2,
+            vertical_margin=0.05,
             horizontal_margin=0.1,
-            font_color=polygon_font["font color (RGB)"],
-            outline_color=polygon_font["outline color (RGB)"],
-            outline_width=2, # TODO: should have polygon_font["outline width"],
-            highlight_color=polygon_font["highlight color (RGB)"] if polygon_font["highlight color exist"] else None,
+            max_extension_factor=2.0,
+            font_color=polygon_font["font_color_rgb"],
+            outline_color=polygon_font["outline_color_rgb"],
+            outline_width=polygon_font["outline_width"],
+            highlight_color=polygon_font["highlight_color_rgb"] if polygon_font["highlight_color_exist"] else None,
             output_path='tmp_translated_text.png',  # TODO: remove this
+            other_polygons=all_polygons
         )
+        
+        # Update the image with the result
+        image = image_result
+        
+        # Update polygons list if they changed
+        if len(new_polygons) > 1:
+            # Polygon was split
+            # Remove the original polygon from all_polygons
+            all_polygons.remove(polygon)
+            # Add the new polygons
+            all_polygons.extend(new_polygons)
+            # Record the changes for later use
+            updated_polygons.append((idx, new_polygons))
+        elif not np.allclose(new_polygons[0], polygon, rtol=1e-5, atol=1e-8):
+            # Polygon was extended but not split
+            # Replace the original polygon with the updated one
+            all_polygons[all_polygons.index(polygon)] = new_polygons[0]
+            # Record the change
+            updated_polygons.append((idx, new_polygons))
     
     # Draw results
     plt.figure(figsize=(12, 12))
@@ -570,24 +562,51 @@ def run_text_recognition(img: np.ndarray, erased_image: np.ndarray, det_polygons
     plt.imshow(img)
     outputs = {}
     output_str = ''
-    for idx, (rec_text, polygon, bbox) in enumerate(
+    
+    # Create a polygon mapping that accounts for updates/splits
+    polygon_mapping = {}
+    for idx, polygon in enumerate(line_polygons):
+        polygon_mapping[idx] = [polygon]
+    
+    # Apply updates to the mapping
+    for idx, new_polygons in updated_polygons:
+        polygon_mapping[idx] = new_polygons
+    
+    # Plot polygons with updated shapes where applicable
+    for idx, (rec_text, _, bbox) in enumerate(
             zip(matched_texts, line_polygons, det_bboxes)):
-        polygon = np.array(polygon).reshape(-1, 2)
-        # convert polygon to closed polygon
-        polygon = np.concatenate([polygon, polygon[:1]], axis=0)
-        plt.plot(polygon[:, 0], polygon[:, 1], '--', color='g', linewidth=2)
-        # plot text on the left top corner of the polygon
-        text_string = f'idx:{idx}, {rec_text}'
-        bbox = bbox.cpu().numpy()
-        plt.text(
-            bbox[0],
-            bbox[1],
-            text_string,
-            color='b',
-            fontsize=13,
-        )
+        
+        # Get all polygons for this index (usually 1, but can be multiple if split)
+        current_polygons = polygon_mapping[idx]
+        
+        for poly_idx, polygon in enumerate(current_polygons):
+            # Add suffix for split polygons
+            text_suffix = f" (part {poly_idx+1})" if len(current_polygons) > 1 else ""
+            
+            polygon_np = np.array(polygon).reshape(-1, 2)
+            # convert polygon to closed polygon
+            polygon_np = np.concatenate([polygon_np, polygon_np[:1]], axis=0)
+            plt.plot(polygon_np[:, 0], polygon_np[:, 1], '--', color='g', linewidth=2)
+            
+            # plot text on the left top corner of the polygon
+            text_string = f'idx:{idx}{text_suffix}, {rec_text}'
+            bbox_np = bbox.cpu().numpy()
+            plt.text(
+                polygon_np[0, 0],  # Use the first point of the polygon
+                polygon_np[0, 1],
+                text_string,
+                color='b',
+                fontsize=13,
+            )
+        
+        # Add to output
         output_str += f'{idx}:{rec_text}' + '\n'
-        outputs[idx] = dict(polygon=polygon.tolist())
+        if len(current_polygons) == 1:
+            outputs[idx] = dict(polygon=current_polygons[0])
+        else:
+            # Store multiple polygons for split text
+            outputs[idx] = dict(polygons=[poly.tolist() if isinstance(poly, np.ndarray) else poly for poly in current_polygons])
+    
     plt.savefig('output.png')
     # convert plt to numpy
     img = cv2.cvtColor(
@@ -604,23 +623,9 @@ if __name__ == '__main__':
             with gr.Column(scale=1):
                 input_image = gr.Image(label='Input Image')
                 erased_image = gr.Image(label='Erased Image')
+                target_language = gr.Textbox(label="Target Language", value="English")
+                srt_file_path = gr.File(label="SRT File", file_types=[".srt"],default=None)
                 replace_text = gr.Button('Run Text Replacement')
-                # text_index = gr.Textbox(
-                #     label='Select Text Index. It can be multiple indices '
-                #           'separated by commas.'
-                # )
-                # diffusion_type = gr.Radio(
-                #     choices=['Stable Diffusion', 'Latent Diffusion'],
-                #     label='Erasing Model')
-                # mask_type = gr.Radio(
-                #     choices=['SAM', 'MMOCR'], label='Mask Type')
-                # dilate_iter = gr.Slider(
-                #     1,
-                #     5,
-                #     value=2,
-                #     step=1,
-                #     label='The dilate iteration to dilate the SAM ouput mask',
-                # )
                 
             with gr.Column(scale=1):
                 output_image = gr.Image(label='Output Image')
@@ -641,7 +646,7 @@ if __name__ == '__main__':
                 )
             replace_text.click(
                 fn=run_text_recognition,
-                inputs=[input_image, erased_image],
+                inputs=[input_image, erased_image, target_language, srt_file_path],
                 outputs=[text_analysis_image, output_image])
                 
             # Add function to handle rotate and crop functionality
