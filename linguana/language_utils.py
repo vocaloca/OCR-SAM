@@ -254,6 +254,39 @@ class MultilinguaTextRenderer:
                 
             return dominant_lang
 
+
+def extract_script_from_srt(file_path):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        lines = file.readlines()
+    
+    script = []
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # Skip empty lines
+        if not line:
+            i += 1
+            continue
+        
+        # Try to interpret the line as a subtitle number
+        try:
+            subtitle_num = int(line)
+            # If this is a subtitle number, the text should be 2 lines ahead
+            # (after the timestamp line)
+            if i + 2 < len(lines):
+                text_line = lines[i + 2].strip()
+                if text_line:  # Only add non-empty lines
+                    script.append(text_line)
+            i += 4  # Skip to the next subtitle block (usually 4 lines per subtitle)
+        except ValueError:
+            # If it's not a subtitle number, just move to next line
+            i += 1
+    
+    return script
+
+
 # Example usage
 if __name__ == "__main__":
     renderer = MultilinguaTextRenderer()
@@ -291,3 +324,18 @@ if __name__ == "__main__":
         outline_width=2,
         output_path="output_mixed.jpg"
     )
+    
+    
+    # Extract script from srt file
+    # Usage
+    file_path = "dubbing_30073257582_full_subtitles_pre_no_ads.srt"
+    script = extract_script_from_srt(file_path)
+
+    # Print or save the script
+    for line in script:
+        print(line)
+
+    # If you want to save to a file
+    with open("extracted_script.txt", "w", encoding="utf-8") as output_file:
+        for line in script:
+            output_file.write(line + "\n")

@@ -366,6 +366,33 @@ def group_polygons_in_lines(polygons: List[np.ndarray],
     return line_groups, line_polygons
 
 
+def clip_polygon_to_image_bounds(polygon, img_width, img_height):
+    """Clip a polygon to ensure it stays within image boundaries.
+    
+    Args:
+        polygon: Flat list of polygon coordinates [x1, y1, x2, y2, ...]
+        img_width: Width of the image
+        img_height: Height of the image
+        
+    Returns:
+        Clipped polygon that stays within image boundaries
+    """
+    # Convert flat list to points array
+    points = [(polygon[i], polygon[i+1]) for i in range(0, len(polygon), 2)]
+    points_np = np.array(points)
+    
+    # Clip x-coordinates
+    points_np[:, 0] = np.clip(points_np[:, 0], 0, img_width - 1)
+    
+    # Clip y-coordinates
+    points_np[:, 1] = np.clip(points_np[:, 1], 0, img_height - 1)
+    
+    # Convert back to flat list
+    clipped_polygon = [coord for point in points_np for coord in point]
+    
+    return clipped_polygon
+
+
 def remove_outliers_from_line(line_indices, polygons, is_horizontal, 
                               height_ratio_threshold=3.0):
     """Remove outlier text boxes from a line based on position
@@ -486,7 +513,17 @@ def generate_line_polygons(lines, polygons):
             box = cv2.boxPoints(rect)
         
         # Return as flattened array [x1, y1, x2, y2, x3, y3, x4, y4]
-        line_polygons.append(box.flatten())
+        flat_polygon = box.flatten()
+        
+        # Find the maximum dimensions from the input polygons as a reference for image size
+        all_points = np.concatenate([np.array(poly).reshape(-1, 2) for poly in polygons])
+        img_width = np.max(all_points[:, 0]) + 10  # Add a small margin
+        img_height = np.max(all_points[:, 1]) + 10  # Add a small margin
+        
+        # Clip the polygon to ensure it's within bounds
+        clipped_polygon = clip_polygon_to_image_bounds(flat_polygon, img_width, img_height)
+        
+        line_polygons.append(clipped_polygon)
         
     return line_polygons
 

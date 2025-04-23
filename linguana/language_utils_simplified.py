@@ -1,13 +1,17 @@
 from typing import Union
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-import math
 import os
-from fontTools.ttLib import TTFont
-import unicodedata
+import numpy as np
+import math
+import cv2
+from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 import requests
-import cv2
+import unicodedata
+import re
+from fontTools.ttLib import TTFont
+
+# Import the clip_polygon_to_image_bounds function from image_ocr_utils
+from linguana.image_ocr_utils import clip_polygon_to_image_bounds
 
 FONTS_DIR = Path(__file__).parent.parent.joinpath("fonts")
 
@@ -426,6 +430,7 @@ class MultilingualTextRenderer:
         """Get a font with good multi-script coverage"""
         universal_fonts = [
             # Common universal fonts
+            FONTS_DIR / "ArchivoNarrow/ArchivoNarrow-BoldItalic.ttf",
             FONTS_DIR / "NotoSans-Regular-Latest.ttf",  # Try latest version first
             FONTS_DIR / "NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
@@ -519,7 +524,11 @@ class MultilingualTextRenderer:
             draw = ImageDraw.Draw(highlight)
             
             # Draw with alpha
-            highlight_with_alpha = highlight_color + (180,)  # Add alpha
+            # Convert highlight_color to tuple if it's a list and add alpha
+            if isinstance(highlight_color, list):
+                highlight_with_alpha = tuple(highlight_color) + (255,)
+            else:
+                highlight_with_alpha = highlight_color + (255,)  # Add alpha
             draw.polygon(points, fill=highlight_with_alpha)
             
             # Composite highlight onto the image
@@ -577,7 +586,7 @@ class MultilingualTextRenderer:
             return output_path
         else:
             return img
-    
+
     def calculate_optimal_font_size(
         self, 
         text, 
@@ -627,8 +636,8 @@ class MultilingualTextRenderer:
             font = self.get_font_for_text(text, mid)
             
             # Get text size
-            dummy_img = Image.new('RGB', (1, 1))
-            draw = ImageDraw.Draw(dummy_img)
+            img = Image.new('RGB', (1, 1))
+            draw = ImageDraw.Draw(img)
             text_bbox = draw.textbbox((0, 0), text, font=font)
             text_width = text_bbox[2] - text_bbox[0]
             text_height = text_bbox[3] - text_bbox[1]
@@ -697,11 +706,14 @@ class MultilingualTextRenderer:
         min_font_size=8,
         vertical_margin=0.1,  # fraction of height
         horizontal_margin=0.1,  # fraction of width
+        max_extension_factor=1.5,  # max horizontal extension factor
         font_color=(0, 0, 0),
         outline_color=None,
         outline_width=0,
         highlight_color=None,
-        output_path=None
+        output_path=None,
+        other_polygons=None,  # List of other polygons to check for overlap
+        max_overlap_threshold=0.1,  # Maximum allowed overlap (fraction of area)
     ):
         """
         Overlay text on an image with automatic font size adjustment to fit the polygon
@@ -714,14 +726,17 @@ class MultilingualTextRenderer:
             min_font_size: Minimum font size to accept
             vertical_margin: Fraction of polygon height to leave as margin (0.1 = 10%)
             horizontal_margin: Fraction of polygon width to leave as margin (0.1 = 10%)
+            max_extension_factor: Maximum extension factor for width
             font_color: RGB tuple for the text color
             outline_color: RGB tuple for the outline color (None for no outline)
             outline_width: Width of the outline in pixels
             highlight_color: RGB tuple for background highlight (None for transparent)
             output_path: Path to save the result (if None, returns the image)
+            other_polygons: List of other polygons to check for overlap
+            max_overlap_threshold: Maximum allowed overlap (fraction of area)
             
         Returns:
-            PIL Image with the overlaid text
+            PIL Image with the overlaid text, and new polygon if it was extended or split
         """
         # Load the image
         if isinstance(image, np.core.ndarray):
@@ -745,47 +760,681 @@ class MultilingualTextRenderer:
         # Get the minimum area rectangle using OpenCV
         rect = cv2.minAreaRect(points_np.astype(np.int32))
         _, (width, height), angle = rect
+        original_width, original_height = width, height
         
         # Handle rotation to keep text right-side up
         # OpenCV's minAreaRect returns angle in range [-90, 0)
         if width < height:
             angle += 90
             width, height = height, width
+            original_width, original_height = original_height, original_width
         
         # Normalize angle to prevent upside-down text
         if angle > 90:
             angle -= 180
         elif angle < -90:
             angle += 180
-            
-        # Calculate optimal font size
-        optimal_font_size = self.calculate_optimal_font_size(
-            text, 
-            width, 
-            height, 
-            img_width, 
-            img_height,
-            angle,
-            centroid_x,
-            centroid_y,
-            min_font_size,
-            max_font_size,
-            vertical_margin,
-            horizontal_margin
-        )
         
-        # Now we have the optimal font size, call the overlay_rotated_text method
-        return self.overlay_rotated_text(
-            image,
+        # Calculate font size based on vertical height (prioritizing height fit)
+        available_height = height * (1 - vertical_margin * 2)  # Allow margin on both top and bottom
+        
+        # Start with a font size proportional to the height
+        vertical_font_size = int(available_height * 0.95)  # Heuristic: fonts typically have some internal padding
+        vertical_font_size = min(max_font_size, max(min_font_size, vertical_font_size))
+        
+        # Create a test font to see if the text fits within the original width
+        font = self.get_font_for_text(text, vertical_font_size)
+        
+        # Measure text dimensions
+        dummy_img = Image.new('RGB', (1, 1))
+        draw = ImageDraw.Draw(dummy_img)
+        text_bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+        
+        # Check if we need to extend the polygon
+        needs_extension = text_width > width * (1 - horizontal_margin * 2)
+        needs_splitting = False
+        new_polygons = []
+        
+        if needs_extension:
+            # Calculate how much we need to extend
+            required_width = text_width / (1 - horizontal_margin * 2)
+            extension_factor = required_width / width
+            
+            # Limit extension factor based on max_extension_factor and available image width
+            max_width_based_factor = (img_width * 0.85) / width  # Limit to 85% of image width
+            max_allowed_factor = min(max_extension_factor, max_width_based_factor)
+            
+            if extension_factor > max_allowed_factor:
+                if text and ' ' in text:
+                    # Text is too long and needs splitting
+                    needs_splitting = True
+                    split_point = len(text) // 2
+                    # Find nearest space to split at
+                    while split_point > 0 and split_point < len(text) - 1:
+                        if text[split_point] == ' ':
+                            break
+                        split_point -= 1
+                    
+                    if split_point == 0:  # No suitable split found, try from the middle to the end
+                        split_point = len(text) // 2
+                        while split_point < len(text) - 1:
+                            if text[split_point] == ' ':
+                                break
+                            split_point += 1
+                    
+                    if split_point > 0 and split_point < len(text) - 1:
+                        part1 = text[:split_point].strip()
+                        part2 = text[split_point:].strip()
+                        
+                        # Original polygon points and center
+                        points_np = np.array(points)
+                        original_centroid_x = centroid_x
+                        original_centroid_y = centroid_y
+                        
+                        # Create two new polygons - one moved up and one moved down
+                        # Calculate vertical offset - half the height of the polygon
+                        offset_distance = height / 2.0
+                        
+                        # Create offsets for the two polygons
+                        up_offset = -offset_distance * 0.75  # Move up by 3/4 of half height
+                        down_offset = offset_distance * 0.75  # Move down by 3/4 of half height
+                        
+                        # Create candidate polygons at these positions
+                        polygon1_points = points_np.copy()
+                        polygon1_points[:, 1] += up_offset
+                        
+                        polygon2_points = points_np.copy()
+                        polygon2_points[:, 1] += down_offset
+                        
+                        # Convert to flat arrays
+                        polygon1 = polygon1_points.flatten().tolist()
+                        polygon2 = polygon2_points.flatten().tolist()
+                        
+                        # Check if either polygon is outside image boundaries
+                        polygon1_outside = False
+                        polygon2_outside = False
+                        
+                        # Check polygon1 (upper polygon)
+                        for i in range(0, len(polygon1), 2):
+                            if polygon1[i] < 0 or polygon1[i] >= img_width or polygon1[i+1] < 0 or polygon1[i+1] >= img_height:
+                                polygon1_outside = True
+                                break
+                                
+                        # Check polygon2 (lower polygon)
+                        for i in range(0, len(polygon2), 2):
+                            if polygon2[i] < 0 or polygon2[i] >= img_width or polygon2[i+1] < 0 or polygon2[i+1] >= img_height:
+                                polygon2_outside = True
+                                break
+                        
+                        # If polygon1 is outside and polygon2 is not, just use polygon2 at the original position
+                        if polygon1_outside and not polygon2_outside:
+                            polygon1 = polygon.copy()  # Use original position for polygon1
+                            polygon2_points = points_np.copy()
+                            polygon2_points[:, 1] += height * 0.9  # Move down by almost the full height
+                            polygon2 = polygon2_points.flatten().tolist()
+                        
+                        # If polygon2 is outside and polygon1 is not, just use polygon1 at the original position
+                        elif polygon2_outside and not polygon1_outside:
+                            polygon2 = polygon.copy()  # Use original position for polygon2
+                            polygon1_points = points_np.copy()
+                            polygon1_points[:, 1] -= height * 0.9  # Move up by almost the full height
+                            polygon1 = polygon1_points.flatten().tolist()
+                        
+                        # If both are outside, try to fit both within the image
+                        elif polygon1_outside and polygon2_outside:
+                            # Try to move polygons to fit within image
+                            # Find min/max Y values for the original polygon
+                            min_y = min(points_np[:, 1])
+                            max_y = max(points_np[:, 1])
+                            
+                            # Calculate available space above and below
+                            space_above = min_y
+                            space_below = img_height - max_y
+                            
+                            # If more space above, prioritize moving polygon1 up and polygon2 to original
+                            if space_above > space_below:
+                                # If enough space above for polygon1
+                                if space_above > height:
+                                    max_up_offset = min(space_above - 10, height * 0.9)  # Leave 10px margin
+                                    polygon1_points = points_np.copy()
+                                    polygon1_points[:, 1] -= max_up_offset
+                                    polygon1 = polygon1_points.flatten().tolist()
+                                    polygon2 = polygon.copy()  # Keep polygon2 at original position
+                                else:
+                                    # Not enough space, try to squeeze both where they fit
+                                    polygon1 = polygon.copy()
+                                    polygon2_points = points_np.copy()
+                                    max_down_offset = min(space_below - 10, height * 0.5)
+                                    if max_down_offset > 20:  # If we can move down by at least 20px
+                                        polygon2_points[:, 1] += max_down_offset
+                                        polygon2 = polygon2_points.flatten().tolist()
+                                    else:
+                                        # Almost no space to move, try splitting horizontally instead
+                                        # Create side-by-side polygons (experimental)
+                                        polygon1 = polygon.copy()
+                                        
+                                        # Create a horizontally shifted polygon (if there's width to spare)
+                                        if width > 100:  # Only try if there's enough width
+                                            polygon2_points = points_np.copy()
+                                            # Shift by width and adjust position to avoid going off-screen
+                                            shift_amount = min(width * 0.8, img_width - max(points_np[:, 0]) - 20)
+                                            if shift_amount > 50:  # Only if we can shift by a meaningful amount
+                                                polygon2_points[:, 0] += shift_amount
+                                                polygon2 = polygon2_points.flatten().tolist()
+                                            else:
+                                                # No good options, use original polygon for both
+                                                polygon2 = polygon.copy()
+                                        else:
+                                            # No good options, use original polygon for both
+                                            polygon2 = polygon.copy()
+                            else:
+                                # More space below, prioritize moving polygon2 down and polygon1 to original
+                                if space_below > height:
+                                    max_down_offset = min(space_below - 10, height * 0.9)  # Leave 10px margin
+                                    polygon2_points = points_np.copy()
+                                    polygon2_points[:, 1] += max_down_offset
+                                    polygon2 = polygon2_points.flatten().tolist()
+                                    polygon1 = polygon.copy()  # Keep polygon1 at original position
+                                else:
+                                    # Similar fallback as above
+                                    polygon2 = polygon.copy()
+                                    polygon1_points = points_np.copy()
+                                    max_up_offset = min(space_above - 10, height * 0.5)
+                                    if max_up_offset > 20:
+                                        polygon1_points[:, 1] -= max_up_offset
+                                        polygon1 = polygon1_points.flatten().tolist()
+                                    else:
+                                        # Almost no space to move, horizontal splitting as above
+                                        polygon1 = polygon.copy()
+                                        
+                                        if width > 100:
+                                            polygon2_points = points_np.copy()
+                                            shift_amount = min(width * 0.8, img_width - max(points_np[:, 0]) - 20)
+                                            if shift_amount > 50:
+                                                polygon2_points[:, 0] += shift_amount
+                                                polygon2 = polygon2_points.flatten().tolist()
+                                            else:
+                                                polygon2 = polygon.copy()
+                                        else:
+                                            polygon2 = polygon.copy()
+                        
+                        # Check for overlaps with other polygons
+                        if other_polygons:
+                            # Calculate overlap scores for different polygon placements
+                            def calculate_overlap(poly, other_polys):
+                                """Calculate total overlap ratio for a polygon against others"""
+                                if not other_polys:
+                                    return 0.0
+                                
+                                poly_points = np.array([
+                                    (poly[i], poly[i+1]) for i in range(0, len(poly), 2)
+                                ]).astype(np.int32)
+                                
+                                poly_area = cv2.contourArea(poly_points)
+                                if poly_area == 0:
+                                    return 0.0  # Avoid division by zero
+                                
+                                # Create mask for the polygon
+                                mask = np.zeros((img_height, img_width), dtype=np.uint8)
+                                cv2.fillPoly(mask, [poly_points], 1)
+                                
+                                # Create a single combined mask for all other polygons
+                                other_mask = np.zeros((img_height, img_width), dtype=np.uint8)
+                                for other_poly in other_polys:
+                                    if np.allclose(other_poly, polygon, rtol=1e-5, atol=1e-8):  # Skip original polygon
+                                        continue
+                                    
+                                    other_points = np.array([
+                                        (other_poly[i], other_poly[i+1]) 
+                                        for i in range(0, len(other_poly), 2)
+                                    ]).astype(np.int32)
+                                    
+                                    # Fill the combined mask
+                                    cv2.fillPoly(other_mask, [other_points], 1)
+                                
+                                # Calculate overlap only once using the combined mask
+                                overlap_area = np.sum(np.logical_and(mask, other_mask))
+                                overlap_ratio = overlap_area / poly_area
+                                
+                                return overlap_ratio
+                            
+                            # Visualize the polygons for debugging
+                            def debug_visualize_polygon_overlap():
+                                # Prepare polygon data
+                                all_polygons = [polygon1] + other_polygons
+                                labels = ["polygon1"] + [f"other_poly{i}" for i in range(len(other_polygons))]
+                                colors = [(255, 0, 0)] + [(0, 0, 255) for _ in range(len(other_polygons))]
+                                
+                                # Determine image dimensions based on polygons
+                                max_x = max(max(poly[i] for i in range(0, len(poly), 2)) for poly in all_polygons)
+                                max_y = max(max(poly[i+1] for i in range(0, len(poly), 2)) for poly in all_polygons)
+                                img_width = max(int(max_x * 1.2), 800)
+                                img_height = max(int(max_y * 1.2), 600)
+                                
+                                # Visualize the polygons
+                                visualize_polygons(
+                                    all_polygons, 
+                                    labels=labels,
+                                    colors=colors,
+                                    img_width=img_width,
+                                    img_height=img_height,
+                                    save_path='tmp_polygons_overlap.png',
+                                    title=f"Polygon1 Overlap: {polygon1_overlap:.2f}"
+                                )
+                            
+                            # Calculate overlaps for our two polygons
+                            original_overlap = calculate_overlap(polygon, other_polygons)
+                            polygon1_overlap = calculate_overlap(polygon1, other_polygons)
+                            polygon2_overlap = calculate_overlap(polygon2, other_polygons)
+                            debug_visualize_polygon_overlap()
+                            
+                            # If both have high overlap, try adjusting positions
+                            if polygon1_overlap > max_overlap_threshold or polygon2_overlap > max_overlap_threshold:
+                                # Try different positions with different offsets
+                                best_poly1 = polygon1
+                                best_poly2 = polygon2
+                                best_total_overlap = polygon1_overlap + polygon2_overlap
+                                
+                                # Try various offsets to find the position with least overlap
+                                for p1_offset in [-height, -height*0.75, -height*0.5, -height*0.25, 0, height*0.25]:
+                                    for p2_offset in [0, height*0.25, height*0.5, height*0.75, height, height*1.25]:
+                                        # Skip if p1 and p2 are too close
+                                        if abs(p1_offset - p2_offset) < height * 0.4:
+                                            continue
+                                            
+                                        # Create test polygons
+                                        test_poly1_points = points_np.copy()
+                                        test_poly1_points[:, 1] += p1_offset
+                                        test_poly1 = test_poly1_points.flatten().tolist()
+                                        
+                                        test_poly2_points = points_np.copy()
+                                        test_poly2_points[:, 1] += p2_offset
+                                        test_poly2 = test_poly2_points.flatten().tolist()
+                                        
+                                        # Skip if either polygon is outside image boundaries
+                                        outside = False
+                                        for poly in [test_poly1, test_poly2]:
+                                            for i in range(0, len(poly), 2):
+                                                if (poly[i] < 0 or poly[i] >= img_width or 
+                                                    poly[i+1] < 0 or poly[i+1] >= img_height):
+                                                    outside = True
+                                                    break
+                                            if outside:
+                                                break
+                                        
+                                        if outside:
+                                            continue
+                                        
+                                        # Calculate total overlap
+                                        other_polys_excluding_test = [p for p in other_polygons 
+                                                                      if not np.allclose(p, polygon)]
+                                        overlap1 = calculate_overlap(test_poly1, other_polys_excluding_test + [test_poly2])
+                                        overlap2 = calculate_overlap(test_poly2, other_polys_excluding_test + [test_poly1])
+                                        total_overlap = overlap1 + overlap2
+                                        
+                                        if total_overlap < best_total_overlap:
+                                            best_total_overlap = total_overlap
+                                            best_poly1 = test_poly1
+                                            best_poly2 = test_poly2
+                                
+                                # Use the best positions found
+                                polygon1 = best_poly1
+                                polygon2 = best_poly2
+                                
+                                debug_visualize_polygon_overlap()
+
+                        # Instead of recursively applying texts one after another, apply them to separate images first
+                        # Create a copy of the original image for the part1 rendering
+                        img_part1 = img.copy() if isinstance(img, Image.Image) else Image.fromarray(img)
+                        
+                        # Render part1 on the first image copy
+                        part1_result = self.overlay_rotated_text(
+                            img_part1,
+                            part1,
+                            polygon1,
+                            font_size=vertical_font_size,
+                            font_color=font_color,
+                            outline_color=outline_color,
+                            outline_width=outline_width,
+                            highlight_color=highlight_color
+                        )
+                        
+                        # Create another copy of the original image for the part2 rendering
+                        img_part2 = img.copy() if isinstance(img, Image.Image) else Image.fromarray(img)
+                        
+                        # Render part2 on the second image copy
+                        part2_result = self.overlay_rotated_text(
+                            img_part2,
+                            part2,
+                            polygon2,
+                            font_size=vertical_font_size,
+                            font_color=font_color,
+                            outline_width=outline_width,
+                            outline_color=outline_color,
+                            highlight_color=highlight_color
+                        )
+                        
+                        # Now composite the two text renderings onto the original image
+                        # Extract just the text parts with alpha from part1_result and part2_result
+                        # by comparing with original image
+                        original_array = np.array(img)
+                        part1_array = np.array(part1_result)
+                        part2_array = np.array(part2_result)
+                        
+                        # Create a new result image starting with the original
+                        final_result = img.copy() if isinstance(img, Image.Image) else Image.fromarray(img)
+                        final_array = np.array(final_result)
+                        
+                        # For each rendering, find the changed pixels and apply them to the final image
+                        # This is a simple approach that works if highlight_color is None
+                        # Otherwise, a more sophisticated alpha compositing would be needed
+                        if highlight_color is None:
+                            # Apply where part1 is different from original
+                            mask1 = np.any(part1_array != original_array, axis=2)
+                            final_array[mask1] = part1_array[mask1]
+                            
+                            # Apply where part2 is different from original
+                            mask2 = np.any(part2_array != original_array, axis=2)
+                            final_array[mask2] = part2_array[mask2]
+                            
+                            # Convert back to PIL Image
+                            final_result = Image.fromarray(final_array)
+                        else:
+                            # When highlight_color is used, we need to use alpha compositing
+                            # Convert to RGBA if not already
+                            if final_result.mode != 'RGBA':
+                                final_result = final_result.convert('RGBA')
+                            
+                            # Composite part1 result onto final result
+                            if part1_result.mode != 'RGBA':
+                                part1_result = part1_result.convert('RGBA')
+                            final_result = Image.alpha_composite(final_result, part1_result)
+                            
+                            # Composite part2 result onto final result
+                            if part2_result.mode != 'RGBA':
+                                part2_result = part2_result.convert('RGBA')
+                            final_result = Image.alpha_composite(final_result, part2_result)
+                        
+                        # Save or return the result with both polygons
+                        new_polygons = [polygon1, polygon2]
+                        if output_path:
+                            final_result.save(output_path)
+                            return output_path, new_polygons
+                        else:
+                            return final_result, new_polygons
+                
+                # If we can't split or the extension is too large, reduce font size
+                adjusted_font_size = self.calculate_optimal_font_size(
+                    text, 
+                    width * max_extension_factor, 
+                    height, 
+                    img_width, 
+                    img_height,
+                    angle,
+                    centroid_x,
+                    centroid_y,
+                    min_font_size,
+                    vertical_font_size,  # Cap at the vertical font size
+                    vertical_margin,
+                    horizontal_margin
+                )
+                
+                # Use the adjusted font size
+                return self.overlay_rotated_text(
+                    img,
+                    text,
+                    polygon,
+                    font_size=adjusted_font_size,
+                    font_color=font_color,
+                    outline_color=outline_color,
+                    outline_width=outline_width,
+                    highlight_color=highlight_color,
+                    output_path=output_path
+                )
+            
+            else:
+                # We can extend the polygon
+                extended_width = width * extension_factor
+                
+                # Create an extended polygon by scaling horizontally
+                # Get the angle in radians
+                angle_rad = math.radians(angle)
+                
+                # Calculate the direction vectors for width and height
+                width_dir_x = math.cos(angle_rad)
+                width_dir_y = math.sin(angle_rad)
+                height_dir_x = -math.sin(angle_rad)
+                height_dir_y = math.cos(angle_rad)
+                
+                # Scale factors
+                width_scale = extension_factor
+                height_scale = 1.0  # Keep height the same
+                
+                # Create new corners based on the scaled width and height
+                half_width = extended_width / 2
+                half_height = height / 2
+                
+                # Generate new corners
+                corners = []
+                corners.append((
+                    centroid_x - width_dir_x * half_width - height_dir_x * half_height,
+                    centroid_y - width_dir_y * half_width - height_dir_y * half_height
+                ))
+                corners.append((
+                    centroid_x + width_dir_x * half_width - height_dir_x * half_height,
+                    centroid_y + width_dir_y * half_width - height_dir_y * half_height
+                ))
+                corners.append((
+                    centroid_x + width_dir_x * half_width + height_dir_x * half_height,
+                    centroid_y + width_dir_y * half_width + height_dir_y * half_height
+                ))
+                corners.append((
+                    centroid_x - width_dir_x * half_width + height_dir_x * half_height,
+                    centroid_y - width_dir_y * half_width + height_dir_y * half_height
+                ))
+                
+                # Convert corners to flat array
+                extended_polygon = [coord for corner in corners for coord in corner]
+                
+                # Ensure the extended polygon stays within image boundaries
+                extended_polygon = clip_polygon_to_image_bounds(extended_polygon, img_width, img_height)
+                
+                # Check if extension causes overlap with other polygons
+                if other_polygons:
+                    # Calculate extended polygon area
+                    extended_points_np = np.array([
+                        (extended_polygon[i], extended_polygon[i+1]) 
+                        for i in range(0, len(extended_polygon), 2)
+                    ])
+                    extended_area = cv2.contourArea(extended_points_np.astype(np.int32))
+                    
+                    excessive_overlap = False
+                    for other_poly in other_polygons:
+                        if np.allclose(other_poly, polygon, rtol=1e-5, atol=1e-8):  # Skip self
+                            continue
+                        
+                        # Convert other polygon to points array
+                        other_points = [(other_poly[i], other_poly[i+1]) for i in range(0, len(other_poly), 2)]
+                        other_points_np = np.array(other_points).astype(np.int32)
+                        
+                        # Calculate intersection area
+                        intersection_mask = np.zeros((img_height, img_width), dtype=np.uint8)
+                        cv2.fillPoly(intersection_mask, [extended_points_np.astype(np.int32)], 1)
+                        
+                        other_mask = np.zeros((img_height, img_width), dtype=np.uint8)
+                        cv2.fillPoly(other_mask, [other_points_np], 1)
+                        
+                        intersection_area = np.sum(np.logical_and(intersection_mask, other_mask))
+                        overlap_ratio = intersection_area / extended_area
+                        
+                        if overlap_ratio > max_overlap_threshold:
+                            excessive_overlap = True
+                            break
+                    
+                    if excessive_overlap:
+                        # Fallback to the optimal font size without extension
+                        adjusted_font_size = self.calculate_optimal_font_size(
+                            text, 
+                            width, 
+                            height, 
+                            img_width, 
+                            img_height,
+                            angle,
+                            centroid_x,
+                            centroid_y,
+                            min_font_size,
+                            vertical_font_size,  # Cap at the vertical font size
+                            vertical_margin,
+                            horizontal_margin
+                        )
+                        
+                        # Use the original polygon with adjusted font size
+                        return self.overlay_rotated_text(
+                            img,
+                            text,
+                            polygon,
+                            font_size=adjusted_font_size,
+                            font_color=font_color,
+                            outline_color=outline_color,
+                            outline_width=outline_width,
+                            highlight_color=highlight_color,
+                            output_path=output_path
+                        )
+                
+                # No overlap or no other polygons to check - proceed with extension
+                # Use the vertical font size with the extended polygon
+                img_result = self.overlay_rotated_text(
+                    img,
+                    text,
+                    extended_polygon,
+                    font_size=vertical_font_size,
+                    font_color=font_color,
+                    outline_color=outline_color,
+                    outline_width=outline_width,
+                    highlight_color=highlight_color,
+                    output_path=output_path
+                )
+                
+                # Return the extended polygon along with the result
+                if output_path:
+                    return output_path, [extended_polygon]
+                else:
+                    return img_result, [extended_polygon]
+        
+        # If we don't need extension, use the vertical font size
+        result = self.overlay_rotated_text(
+            img,
             text,
             polygon,
-            font_size=optimal_font_size,
+            font_size=vertical_font_size,
             font_color=font_color,
             outline_color=outline_color,
             outline_width=outline_width,
             highlight_color=highlight_color,
             output_path=output_path
         )
+        
+        # No changes to the polygon
+        if output_path:
+            return output_path, [polygon]
+        else:
+            return result, [polygon]
+
+def visualize_polygons(polygons, labels=None, img_width=800, img_height=600, save_path='tmp__polygons_overlap.png',
+                      colors=None, background_color=(255, 255, 255), draw_labels=True, title=None):
+    """
+    Visualize multiple polygons on a canvas and save the image.
+    
+    Args:
+        polygons: List of polygons, each as a flat list [x1,y1,x2,y2,...]
+        labels: Optional list of labels for each polygon
+        img_width: Width of the output image
+        img_height: Height of the output image
+        save_path: Path to save the output image
+        colors: List of RGB colors for each polygon, or None for automatic colors
+        background_color: RGB color for the background
+        draw_labels: Whether to draw labels
+        title: Optional title for the image
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    import random
+    import os
+    
+    # Create blank image
+    img = Image.new('RGB', (img_width, img_height), background_color)
+    draw = ImageDraw.Draw(img)
+    
+    # Generate colors if not provided
+    if colors is None:
+        colors = []
+        for _ in range(len(polygons)):
+            r = random.randint(0, 200)  # Keep under 200 to ensure contrast
+            g = random.randint(0, 200)
+            b = random.randint(0, 200)
+            colors.append((r, g, b))
+    
+    # Ensure labels list is the same length as polygons
+    if labels is None:
+        labels = [f"Polygon {i+1}" for i in range(len(polygons))]
+    elif len(labels) < len(polygons):
+        labels.extend([f"Polygon {i+1}" for i in range(len(labels), len(polygons))])
+    
+    # Draw each polygon
+    for i, poly in enumerate(polygons):
+        # Convert flat array to list of points
+        points = [(poly[j], poly[j+1]) for j in range(0, len(poly), 2)]
+        
+        # Draw polygon
+        draw.polygon(points, outline=(0, 0, 0), fill=colors[i] + (128,))  # Add alpha
+        
+        # Draw points as circles
+        for point in points:
+            draw.ellipse((point[0]-3, point[1]-3, point[0]+3, point[1]+3), fill=(255, 0, 0))
+        
+        # Draw label
+        if draw_labels:
+            # Calculate centroid for label placement
+            centroid_x = sum(p[0] for p in points) / len(points)
+            centroid_y = sum(p[1] for p in points) / len(points)
+            
+            # Draw label with contrasting color
+            try:
+                font = ImageFont.truetype("arial.ttf", 12)
+            except:
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+                except:
+                    font = ImageFont.load_default()
+            
+            # Draw white background for text for better readability
+            text_bbox = draw.textbbox((centroid_x, centroid_y), labels[i], font=font)
+            padding = 2
+            draw.rectangle(
+                (text_bbox[0]-padding, text_bbox[1]-padding, 
+                 text_bbox[2]+padding, text_bbox[3]+padding), 
+                fill=(255, 255, 255)
+            )
+            
+            draw.text((centroid_x, centroid_y), labels[i], fill=(0, 0, 0), font=font, anchor="mm")
+    
+    # Draw title
+    if title:
+        try:
+            title_font = ImageFont.truetype("arial.ttf", 16)
+        except:
+            try:
+                title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+            except:
+                title_font = ImageFont.load_default()
+        
+        draw.text((img_width//2, 20), title, fill=(0, 0, 0), font=title_font, anchor="mm")
+    
+    # Save image
+    img.save(save_path)
+    print(f"Polygons visualization saved to {os.path.abspath(save_path)}")
+    return save_path
 
 # Example usage
 if __name__ == "__main__":
